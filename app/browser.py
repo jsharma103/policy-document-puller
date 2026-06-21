@@ -1,0 +1,79 @@
+"""Launch a browser + context per carrier LaunchSpec.
+
+One Playwright instance per engine (started lazily, reused across sessions).
+Each session gets its own browser + a fresh ephemeral context (nothing
+persisted). Mode / channel / viewport / egress all come from the carrier's
+LaunchSpec; proxy secrets are resolved from the environment here so adapters
+never touch them.
+"""
+from dataclasses import dataclass
+
+from playwright.async_api import Browser as PWBrowser
+from playwright.async_api import BrowserContext, Page
+
+from . import config
+from .carriers.base import Egress, LaunchSpec
+
+_WEBDRIVER_MASK = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+_pw_by_engine: dict[str, object] = {}
+
+
+async def _playwright(engine: str):
+    if engine not in _pw_by_engine:
+        if engine == "patchright":
+            from patchright.async_api import async_playwright
+        else:
+            from playwright.async_api import async_playwright
+        _pw_by_engine[engine] = await async_playwright().start()
+    return _pw_by_engine[engine]
+
+
+@dataclass
+class Browser:
+    pw_browser: PWBrowser
+    context: BrowserContext
+    page: Page
+
+    async def aclose(self) -> None:
+        try:
+            await self.context.close()
+        finally:
+            await self.pw_browser.close()
+
+
+async def launch(spec: LaunchSpec) -> Browser:
+    pw = await _playwright(spec.engine)
+    headless = spec.headless
+    if config.HEADLESS_OVERRIDE in ("0", "1"):
+        headless = config.HEADLESS_OVERRIDE == "1"
+
+    launch_kwargs: dict = {
+        "headless": headless,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    if spec.channel:
+        launch_kwargs["channel"] = spec.channel
+    if spec.egress == Egress.MOBILE_PROXY:
+        proxy = config.soax_proxy()
+        if proxy is not None:
+            launch_kwargs["proxy"] = proxy
+        else:
+            # No proxy configured → go direct. Fine on a residential IP (local
+            # dev); from a datacenter IP State Farm fake-rejects as bad creds.
+            print("[browser] no SOAX proxy set — running DIRECT egress "
+                  "(ok locally on a residential IP, not from the droplet)")
+
+    browser = await pw.chromium.launch(**launch_kwargs)
+    ctx_kwargs: dict = {"accept_downloads": True}
+    if spec.no_viewport:
+        ctx_kwargs["no_viewport"] = True
+    context = await browser.new_context(**ctx_kwargs)
+    await context.add_init_script(_WEBDRIVER_MASK)
+    page = await context.new_page()
+    return Browser(pw_browser=browser, context=context, page=page)
+
+
+async def shutdown() -> None:
+    for pw in _pw_by_engine.values():
+        await pw.stop()
+    _pw_by_engine.clear()
