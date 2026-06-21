@@ -30,6 +30,17 @@ _DC = ("https://documentcenterui-prod-custdocmgmtweb.apps.gdrosa.redk8s."
 DOC_CENTER_URL = _DC + "/"
 VIEWER_URL = _DC + "/document?documentId={documentId}&commId={commId}"
 
+# Direct PDF path (skips both viewer SPAs): the proxy endpoint trades a
+# documentId+commId for the doc's custIndexId + a one-time authToken; the blob
+# endpoint then serves the PDF given those.
+_DC_PROXY = ("https://documentcenterproxyv1-prod-custdocmgmtweb.apps.gdrosa."
+             "redk8s.statefarm.com/DocumentCenterProxyV1")
+_DOC_INFO_SVC = ("https://documentinformationservice-prod-custdocmgmtweb.apps."
+                 "gdrosa.redk8s.statefarm.com/DocumentInformationService")
+# Bearer token the SPA sends to the doc APIs, captured per browser context from
+# its own customerMetadata request and reused for the direct PDF fetch.
+_ctx_auth: dict[int, str] = {}
+
 USER_SELS = ("#input", "input[autocomplete~='username']",
              "input[autocomplete*='username' i]",
              "input[placeholder='User ID' i]", "input[placeholder*='user id' i]",
@@ -121,36 +132,117 @@ class StateFarmAdapter:
 
     async def submit_mfa(self, page: Page, code: str) -> None:
         await _enter_otp(page, code)                # prototype's enter_otp logic
-        await _submit(page)
+        # Capture the OAuth access token from the post-MFA token exchange so the
+        # doc APIs can be called directly (skip the Document Center SPA).
+        try:
+            async with page.expect_response(
+                    lambda r: "/v1/token" in r.url.lower() and r.request.method == "POST",
+                    timeout=15000) as info:
+                await _submit(page)
+            data = await (await info.value).json()
+            tok = data.get("access_token")
+            if tok:
+                _ctx_auth[id(page.context)] = f"Bearer {tok}"
+                return   # token in hand — skip the ~4s passkey/callback/landing
+                         # chain. list_documents fires the pure-API doc flow
+                         # immediately and completes the SSO only if that 401s.
+        except Exception:
+            pass   # not captured -> drive the SSO so the SPA path works
 
-        # Multi-domain OAuth/SSO chain: dismiss passkey, wait to land on
-        # my.statefarm.com, then let the cross-domain cookie settle.
-        for _ in range(40):                         # up to ~20s through redirects
-            await page.wait_for_timeout(500)
+        await self._complete_sso(page)
+
+    async def _complete_sso(self, page: Page) -> None:
+        """Dismiss the passkey-enroll screen and wait to land on my.statefarm.com
+        (the OAuth callback that sets the session cookies). Needed only when the
+        pure-API doc flow can't run on the captured token alone."""
+        if "my.statefarm.com" in page.url:
+            return
+        for _ in range(90):                         # up to ~18s through redirects
+            await page.wait_for_timeout(200)
             await _dismiss_passkey(page)
             if "my.statefarm.com" in page.url:
-                break
-        else:
-            raise RuntimeError("did not reach my.statefarm.com after MFA (SSO stalled)")
-        await page.wait_for_timeout(1500)           # cross-domain cookie settle
-                                                    # (Document Center handshake retries if too short)
+                return
+        raise RuntimeError("did not reach my.statefarm.com after MFA (SSO stalled)")
 
     async def list_documents(self, context: BrowserContext, page: Page) -> list[DocMeta]:
+        # Fast path: call customerMetadata directly with the OAuth token captured
+        # at MFA — skips both the ~4s SSO tail (submit_mfa returned early) AND the
+        # Document Center SPA's ~12 requests. If the token alone isn't enough (the
+        # proxy needs the landing's session cookies), complete the SSO then load
+        # the SPA (which also re-captures the token for fetch_pdf).
+        try:
+            data = await self._customer_metadata_direct(context)
+            docs = _extract_docs(data)
+            if docs:
+                print("  [sf] list_documents via direct API (no SPA, no SSO wait)", flush=True)
+                return docs
+        except Exception as e:
+            print(f"  [sf] direct customerMetadata failed ({e}); completing SSO + SPA", flush=True)
+        await self._complete_sso(page)
         data = await self._load_doc_center(page)
         docs = _extract_docs(data)
         if not docs:
             raise RuntimeError("no documents found in customerMetadata")
         return docs
 
+    async def _customer_metadata_direct(self, context: BrowserContext):
+        auth = _ctx_auth.get(id(context))
+        if not auth:
+            raise RuntimeError("no OAuth token captured")
+        r = await context.request.get(f"{_DC_PROXY}/customerMetadata?year=0",
+                                      headers={"authorization": auth})
+        if not r.ok:
+            raise RuntimeError(f"customerMetadata -> {r.status}")
+        return await r.json()
+
     async def fetch_pdf(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
+        # Fast path: two API calls, no SPA. Falls back to driving the viewer if
+        # the direct path ever fails (e.g. SF changes the proxy contract).
+        try:
+            return await self._fetch_pdf_direct(context, doc)
+        except Exception as e:
+            print(f"  [sf] direct PDF fetch failed ({e}); falling back to viewer", flush=True)
+            return await self._fetch_pdf_via_viewer(context, page, doc)
+
+    async def _fetch_pdf_direct(self, context: BrowserContext, doc: DocMeta) -> bytes:
+        auth = _ctx_auth.get(id(context))
+        if not auth:
+            raise RuntimeError("no captured Bearer token for this session")
+        headers = {"authorization": auth}
+        proxy_url = (f"{_DC_PROXY}/document?documentId={doc.extra['documentId']}"
+                     f"&commId={doc.extra['commId']}")
+        r = await context.request.get(proxy_url, headers=headers)
+        if not r.ok:
+            raise RuntimeError(f"proxy /document -> {r.status}")
+        meta = await r.json()
+        cust = _deep_find(meta, ("custindexid",))
+        token = _deep_find(meta, ("authtoken",))
+        if not (cust and token):
+            raise RuntimeError("no custIndexId/authToken in proxy JSON")
+        blob_url = (f"{_DOC_INFO_SVC}/blob/{cust}"
+                    f"?filter[authToken]={token}"
+                    f"&filter[consumerIdentification]=DocumentCenterUI"
+                    f"&filter[cachePrefix]=docproxy:doc:")
+        # The blob is on a different domain; its auth is the one-time authToken in
+        # the query, NOT the proxy's Bearer. Try query-only first, then Bearer.
+        rb = await context.request.get(blob_url)
+        body = await rb.body()
+        if body[:5] != b"%PDF-":
+            rb = await context.request.get(blob_url, headers=headers)
+            body = await rb.body()
+        if body[:5] != b"%PDF-":
+            raise RuntimeError(f"blob -> {rb.status}, not a PDF")
+        return body
+
+    async def _fetch_pdf_via_viewer(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
+        await self._complete_sso(page)   # the viewer needs the landed session
         url = VIEWER_URL.format(documentId=doc.extra["documentId"],
                                 commId=doc.extra["commId"])
-        await page.goto(url, wait_until="commit")   # don't block on full DOM; poll for the redirect
-        for _ in range(75):                         # ~22s — viewer is much slower via proxy on the VM
+        await page.goto(url, wait_until="commit")
+        for _ in range(75):
             if "documentinformationservice" in page.url.lower():
                 break
             await page.wait_for_timeout(300)
-        # The bare blob 401s; fetch the LANDED url through the live authed context.
         r = await context.request.get(page.url)
         body = await r.body()
         if body[:5] != b"%PDF-":
@@ -166,6 +258,15 @@ class StateFarmAdapter:
         # slow and pulls all the PDFs; fetch_pdf gets the one we want afterward.
         # (customerMetadata + the SSO handshake are different endpoints, unaffected.)
         _pat = re.compile(r"documentinformationservice")
+        cid = id(page.context)
+
+        def _grab_auth(req):
+            # Capture the Bearer token the SPA puts on its doc-API calls so
+            # fetch_pdf can hit the proxy/blob endpoints directly.
+            if "documentcenterproxyv1" in req.url or "documentinformationservice" in req.url:
+                a = (req.headers or {}).get("authorization")
+                if a:
+                    _ctx_auth[cid] = a
 
         async def _block(route):
             try:
@@ -173,6 +274,7 @@ class StateFarmAdapter:
             except Exception:
                 pass
 
+        page.on("request", _grab_auth)
         await page.route(_pat, _block)
         try:
             last_err: Exception | None = None
@@ -193,6 +295,7 @@ class StateFarmAdapter:
                     break
             raise RuntimeError(f"could not load the Document Center: {last_err}")
         finally:
+            page.remove_listener("request", _grab_auth)
             await page.unroute(_pat, _block)
 
 
@@ -327,6 +430,25 @@ async def _dismiss_passkey(page: Page) -> None:
             continue
 
 
+def _deep_find(obj, keys: tuple) -> str | None:
+    """First scalar value whose (lowercased) key is in `keys`, searched
+    recursively — robust to where SF nests custIndexId / authToken in the JSON."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in keys and isinstance(v, (str, int)):
+                return str(v)
+        for v in obj.values():
+            r = _deep_find(v, keys)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _deep_find(v, keys)
+            if r:
+                return r
+    return None
+
+
 def _extract_docs(data) -> list[DocMeta]:
     """Pull doc entries (documentId + communicationId) from customerMetadata and
     sort the policy BINDER first (the real document)."""
@@ -355,7 +477,10 @@ def _extract_docs(data) -> list[DocMeta]:
     docs.sort(key=_doc_rank)
     print("  [sf] discovered docs (sorted): " +
           " | ".join(f"{d.title}/{d.category}" for d in docs), flush=True)
-    return docs
+    # Show only policy documents — drop billing/payment receipts (rank 3), which
+    # aren't policy docs. Fall back to all if filtering would empty the list.
+    policy = [d for d in docs if _doc_rank(d) < 3]
+    return policy or docs
 
 
 def _doc_rank(d: DocMeta) -> int:

@@ -74,6 +74,31 @@ returning users skip the code.
 
 ---
 
+## Stream / pipeline the auth + rendering to cut perceived latency
+
+Idea: overlap and stream the login (username / password / OTP) and the PDF
+rendering instead of strictly sequential steps, to shave time off login + render.
+
+Concrete angles:
+- **Progressive PDF streaming.** `fetch_pdf` pulls the full blob, then the
+  frontend loads it into the iframe. Stream the bytes (FastAPI `StreamingResponse`,
+  chunked) so the viewer renders page 1 while the rest downloads — faster
+  perceived render, especially for big multi-page docs.
+- **Pipeline the post-MFA work.** The OAuth token is captured early (at
+  `/v1/token`). Fire `customerMetadata` + the binder fetch *without* waiting out
+  the full passkey/callback/landing chain — overlap the doc fetch with the SSO
+  tail. Caveat: the proxy endpoints may need the callback's session cookies, so
+  firing too early could 401 — needs testing.
+- **Reality check on the credential steps.** The OTP can't be pre-entered (the
+  code is only sent after the creds submit), and the SSO redirects are inherently
+  sequential (each depends on the prior). So the real wins are rendering +
+  overlapping the doc fetch, not the credential typing.
+
+Why deferred: the flow already meets 8s locally; hosted is proxy-bound (the
+`submit_mfa` SSO chain). These are perceived-latency / margin optimizations.
+
+---
+
 ## Other deferred (see README "Known limitations")
 
 - State Farm latency: resource-blocking (drop images/ads/analytics) to cut

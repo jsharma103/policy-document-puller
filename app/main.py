@@ -6,6 +6,7 @@ wait by the SessionStore. Credentials are used in-memory and never logged; PDFs
 are streamed to the client and never written to disk.
 """
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -101,6 +102,7 @@ async def login(req: LoginReq):
         mfa = await adapter.start_login(
             sess.browser.page, Credentials(username=req.username, password=req.password))
     except Exception as e:
+        print(f"  [login err] {req.carrier}: {type(e).__name__}: {e}", flush=True)
         await store.close(sess.id)
         raise HTTPException(502, f"login failed: {e}")
     return {"session_id": sess.id,
@@ -113,11 +115,24 @@ async def mfa(req: MfaReq):
     if sess is None:
         raise HTTPException(404, "session expired")
     try:
+        t = time.perf_counter()
         await sess.adapter.submit_mfa(sess.browser.page, req.code)
+        print(f"  [t] submit_mfa: {time.perf_counter() - t:.2f}s", flush=True)
     except Exception as e:
         raise HTTPException(502, f"mfa failed: {e}")
     sess.authenticated = True
-    return {"ok": True}
+    # Fold discovery into the MFA response so the client skips a separate
+    # /api/documents round-trip. Best-effort — on failure the client falls back.
+    docs_out = []
+    try:
+        t = time.perf_counter()
+        sess.docs = await sess.adapter.list_documents(sess.browser.context, sess.browser.page)
+        print(f"  [t] list_documents: {time.perf_counter() - t:.2f}s", flush=True)
+        docs_out = [{"doc_id": d.doc_id, "title": d.title, "category": d.category}
+                    for d in sess.docs]
+    except Exception as e:
+        print(f"  [docs err] {sess.carrier}: {e}", flush=True)
+    return {"ok": True, "docs": docs_out}
 
 
 @app.get("/api/documents")
@@ -126,7 +141,9 @@ async def documents(session_id: str):
     if sess is None:
         raise HTTPException(404, "session expired")
     try:
+        t = time.perf_counter()
         sess.docs = await sess.adapter.list_documents(sess.browser.context, sess.browser.page)
+        print(f"  [t] list_documents: {time.perf_counter() - t:.2f}s", flush=True)
     except Exception as e:
         print(f"  [docs err] {sess.carrier}: {e}", flush=True)
         raise HTTPException(502, f"document discovery failed: {e}")
@@ -142,7 +159,9 @@ async def doc_pdf(doc_id: str, session_id: str):
     if doc is None:
         raise HTTPException(404, "unknown document")
     try:
+        t = time.perf_counter()
         body = await sess.adapter.fetch_pdf(sess.browser.context, sess.browser.page, doc)
+        print(f"  [t] fetch_pdf: {time.perf_counter() - t:.2f}s", flush=True)
     except Exception as e:
         print(f"  [pdf err] {doc.title}: {e}", flush=True)
         raise HTTPException(502, f"pdf fetch failed: {e}")

@@ -64,6 +64,22 @@ function setLatency(which, secs) {
   $('latency').textContent = parts.join('\n');
 }
 
+// Switching carriers starts fresh: close any active session and wipe the UI so
+// the previous carrier's creds, doc list, and rendered PDF don't linger.
+function resetUI() {
+  if (sid) { navigator.sendBeacon('/api/session/' + sid + '/close'); sid = null; }
+  tLogin = tMfa = null; lat.login = lat.render = null;
+  $('username').value = '';
+  $('password').value = '';
+  $('code').value = '';
+  $('mfa').classList.add('hidden');
+  $('docs').innerHTML = '';
+  $('viewer').removeAttribute('src');
+  $('viewer').classList.add('hidden');
+  $('latency').textContent = '';
+  $('log').textContent = '';
+}
+
 async function api(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) {
@@ -85,6 +101,7 @@ async function api(url, opts) {
 // if it doesn't warm, login just launches fresh. Biggest win on State Farm
 // (headful + proxy); marginal on Lemonade (already fast).
 $('carrier').onchange = async () => {
+  resetUI();
   if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
   try {
     const r = await api('/api/prewarm', {
@@ -128,12 +145,15 @@ $('mfaBtn').onclick = async () => {
   log('verifying code…');
   tMfa = performance.now();          // 8s-budget clock starts at code submit
   try {
-    await api('/api/mfa', {
+    const res = await api('/api/mfa', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ session_id: sid, code: $('code').value }),
     });
     $('mfa').classList.add('hidden');
-    await loadDocs();
+    // MFA response carries the docs (discovery folded in) — render directly,
+    // skipping a separate /api/documents round-trip. Fall back if absent.
+    if (res.docs && res.docs.length) renderDocs(res.docs);
+    else await loadDocs();
   } catch (e) { log('mfa failed: ' + e.message); }
 };
 
@@ -153,7 +173,10 @@ function showDoc(id) {
 
 async function loadDocs() {
   log('fetching documents…');
-  const docs = await api('/api/documents?session_id=' + sid);
+  renderDocs(await api('/api/documents?session_id=' + sid));
+}
+
+function renderDocs(docs) {
   $('docs').innerHTML = '<h3>Documents</h3>' + (docs.length
     ? docs.map((d) => `<div class="doc" data-id="${d.doc_id}">${d.title}${d.category ? ' (' + d.category + ')' : ''}</div>`).join('')
     : '<p>No documents found.</p>');
