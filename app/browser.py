@@ -15,17 +15,15 @@ from . import config
 from .carriers.base import Egress, LaunchSpec
 
 _WEBDRIVER_MASK = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-_pw_by_engine: dict[str, object] = {}
+_pw = None  # patchright Playwright, started once and reused across sessions
 
 
-async def _playwright(engine: str):
-    if engine not in _pw_by_engine:
-        if engine == "patchright":
-            from patchright.async_api import async_playwright
-        else:
-            from playwright.async_api import async_playwright
-        _pw_by_engine[engine] = await async_playwright().start()
-    return _pw_by_engine[engine]
+async def _patchright():
+    global _pw
+    if _pw is None:
+        from patchright.async_api import async_playwright
+        _pw = await async_playwright().start()
+    return _pw
 
 
 @dataclass
@@ -42,7 +40,7 @@ class Browser:
 
 
 async def launch(spec: LaunchSpec) -> Browser:
-    pw = await _playwright(spec.engine)
+    pw = await _patchright()
     headless = spec.headless
     if config.HEADLESS_OVERRIDE in ("0", "1"):
         headless = config.HEADLESS_OVERRIDE == "1"
@@ -51,8 +49,6 @@ async def launch(spec: LaunchSpec) -> Browser:
         "headless": headless,
         "args": ["--disable-blink-features=AutomationControlled"],
     }
-    if spec.channel:
-        launch_kwargs["channel"] = spec.channel
     if spec.egress == Egress.MOBILE_PROXY:
         proxy = config.soax_proxy()
         if proxy is not None:
@@ -64,16 +60,14 @@ async def launch(spec: LaunchSpec) -> Browser:
                   "(ok locally on a residential IP, not from the droplet)")
 
     browser = await pw.chromium.launch(**launch_kwargs)
-    ctx_kwargs: dict = {"accept_downloads": True}
-    if spec.no_viewport:
-        ctx_kwargs["no_viewport"] = True
-    context = await browser.new_context(**ctx_kwargs)
+    context = await browser.new_context(accept_downloads=True)
     await context.add_init_script(_WEBDRIVER_MASK)
     page = await context.new_page()
     return Browser(pw_browser=browser, context=context, page=page)
 
 
 async def shutdown() -> None:
-    for pw in _pw_by_engine.values():
-        await pw.stop()
-    _pw_by_engine.clear()
+    global _pw
+    if _pw is not None:
+        await _pw.stop()
+        _pw = None

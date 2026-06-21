@@ -22,7 +22,6 @@ class Session:
     browser: Browser
     authenticated: bool = False
     docs: list[DocMeta] = field(default_factory=list)
-    created: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
 

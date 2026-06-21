@@ -23,7 +23,7 @@ _SUBMIT_SELS = ("button[type=submit]", "button:has-text('Log in')",
 
 class LemonadeAdapter:
     name = "lemonade"
-    launch = LaunchSpec(engine="patchright", headless=True, egress=Egress.DIRECT)
+    launch = LaunchSpec(headless=True, egress=Egress.DIRECT)
 
     async def prewarm(self, page: Page) -> None:
         """Optional speedup: load the login page ahead of time so start_login can
@@ -49,7 +49,7 @@ class LemonadeAdapter:
                 state="visible", timeout=20000)
         except Exception as e:
             raise RuntimeError(f"did not reach the code screen: {e}")
-        return MfaPrompt(required=True, kind="email_code",
+        return MfaPrompt(required=True,
                          message="Enter the 6-digit code Lemonade emailed you.")
 
     async def submit_mfa(self, page: Page, code: str) -> None:

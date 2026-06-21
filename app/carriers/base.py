@@ -18,7 +18,7 @@ environment by the browser layer, not embedded here.
 """
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from playwright.async_api import BrowserContext, Page
 
@@ -32,10 +32,7 @@ class Egress(str, Enum):
 class LaunchSpec:
     """How a carrier's browser must be launched. Captured per-carrier because
     each tolerates different things (see carrier-flow findings)."""
-    engine: str = "patchright"        # "patchright" (stealth) | "playwright"
     headless: bool = True             # State Farm must be headful (run under Xvfb on the server)
-    channel: str | None = None        # leave None — patchright's bundled Chromium is the proven path
-    no_viewport: bool = False         # leave False — the prototype proved the default 1280x720 viewport
     egress: Egress = Egress.DIRECT    # State Farm: MOBILE_PROXY
 
 
@@ -49,7 +46,6 @@ class Credentials:
 class MfaPrompt:
     """Returned by start_login — tells the UI whether/what to ask the user."""
     required: bool
-    kind: str = ""                    # "email_code" | "sms_code"
     message: str = ""                 # human-facing hint for the prompt
 
 
@@ -59,10 +55,9 @@ class DocMeta:
     doc_id: str                       # opaque id the adapter understands
     title: str
     category: str = ""
-    extra: dict = field(default_factory=dict)  # carrier fetch hints (commId, custIndexId, viewer route…)
+    extra: dict = field(default_factory=dict)  # carrier fetch hints (form_url, commId, viewer route…)
 
 
-@runtime_checkable
 class CarrierAdapter(Protocol):
     """Implemented by each carrier. The app driver only ever talks to this."""
 

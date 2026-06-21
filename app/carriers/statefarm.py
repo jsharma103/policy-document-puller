@@ -54,8 +54,7 @@ class StateFarmAdapter:
     # channel="chrome") at the default 1280x720 viewport (NO no_viewport). The
     # earlier channel/no_viewport overrides changed SF's responsive layout and
     # broke the step-up clicks.
-    launch = LaunchSpec(engine="patchright", headless=False,
-                        egress=Egress.MOBILE_PROXY)
+    launch = LaunchSpec(headless=False, egress=Egress.MOBILE_PROXY)
 
     async def prewarm(self, page: Page) -> None:
         """Optional speedup: navigate to the login page (the slow part — loading
@@ -100,7 +99,7 @@ class StateFarmAdapter:
             await page.wait_for_timeout(500)
             await _dismiss_passkey(page)
             if await _otp_present(page) or "login-ui/vc" in page.url.lower():
-                return MfaPrompt(required=True, kind="sms_code",
+                return MfaPrompt(required=True,
                                  message="Enter the code State Farm texted you.")
             try:
                 body = (await page.inner_text("body")).lower()
@@ -352,8 +351,7 @@ def _extract_docs(data) -> list[DocMeta]:
         title = str(o.get("type") or o.get("category") or "Document")
         docs.append(DocMeta(
             doc_id=did, title=title, category=str(o.get("category", "")),
-            extra={"documentId": did, "commId": commid,
-                   "custIndexId": str(o.get("custIndexId") or "")}))
+            extra={"documentId": did, "commId": commid}))
     docs.sort(key=_doc_rank)
     print("  [sf] discovered docs (sorted): " +
           " | ".join(f"{d.title}/{d.category}" for d in docs), flush=True)

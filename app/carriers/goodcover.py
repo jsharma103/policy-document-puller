@@ -23,7 +23,7 @@ _LOGIN_SELS = ("button:has-text('Log in')", "button:has-text('Login')", "button[
 
 class GoodcoverAdapter:
     name = "goodcover"
-    launch = LaunchSpec(engine="patchright", headless=True, egress=Egress.DIRECT)
+    launch = LaunchSpec(headless=True, egress=Egress.DIRECT)
 
     async def prewarm(self, page: Page) -> None:
         """Load the login page ahead of time so start_login fills immediately."""

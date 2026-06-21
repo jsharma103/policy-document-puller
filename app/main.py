@@ -104,7 +104,7 @@ async def login(req: LoginReq):
         await store.close(sess.id)
         raise HTTPException(502, f"login failed: {e}")
     return {"session_id": sess.id,
-            "mfa": {"required": mfa.required, "kind": mfa.kind, "message": mfa.message}}
+            "mfa": {"required": mfa.required, "message": mfa.message}}
 
 
 @app.post("/api/mfa")
