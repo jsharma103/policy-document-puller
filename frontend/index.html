@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Policy Document Puller</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin: .5rem 0 .15rem; font-size: .9rem; }
+  input, select, button { font-size: 1rem; padding: .45rem; width: 100%; box-sizing: border-box; }
+  button { margin-top: .75rem; cursor: pointer; }
+  .hidden { display: none; }
+  #log { color: #b00; white-space: pre-wrap; margin-top: .75rem; min-height: 1.2em; }
+  .doc { cursor: pointer; color: #06c; text-decoration: underline; padding: .25rem 0; }
+  iframe { width: 100%; height: 640px; border: 1px solid #ccc; margin-top: .75rem; }
+  #latency { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; margin-top: .5rem; font-size: .85rem; color: #333; }
+</style>
+</head>
+<body>
+<h1>Policy Document Puller</h1>
+
+<label>Carrier</label>
+<select id="carrier"></select>
+
+<label>Username / email</label>
+<input id="username" autocomplete="off">
+
+<label>Password <small>(leave blank for passwordless carriers)</small></label>
+<input id="password" type="password" autocomplete="off">
+
+<button id="loginBtn">Log in</button>
+
+<div id="mfa" class="hidden">
+  <label id="mfaMsg"></label>
+  <input id="code" inputmode="numeric" autocomplete="off">
+  <button id="mfaBtn">Submit code</button>
+</div>
+
+<div id="docs"></div>
+<iframe id="viewer" class="hidden" title="policy document"></iframe>
+<div id="log"></div>
+<div id="latency"></div>
+
+<script>
+let sid = null;
+let prewarmSid = null;
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $('log').textContent = m; };
+
+// Two automation timers (both exclude the human typing the code):
+//   login  = Login click → MFA prompt shown
+//   render = MFA-submit click → document rendered (the 8s-budget number)
+let tLogin = null, tMfa = null, mfaUsed = true;
+const lat = { login: null, render: null };
+function setLatency(which, secs) {
+  lat[which] = secs;
+  const parts = [];
+  if (lat.login != null) parts.push('Login → MFA prompt: ' + lat.login.toFixed(2) + 's');
+  if (lat.render != null) {
+    const label = mfaUsed ? 'MFA submit → document' : 'Login → document';
+    parts.push(label + ': ' + lat.render.toFixed(2) + 's '
+      + (lat.render <= 8 ? '✓ under 8s' : '⚠ over 8s'));
+  }
+  $('latency').textContent = parts.join('\n');
+}
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    let detail = r.status;
+    try { detail = (await r.json()).detail || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+(async () => {
+  const cs = await api('/api/carriers');
+  $('carrier').innerHTML = cs.map((c) => `<option>${c}</option>`).join('');
+})();
+
+// Pre-warm the selected carrier (launch browser + load its login page) the
+// moment it's picked, so that slow part overlaps with credential typing. The
+// backend only warms carriers that implement prewarm; best-effort either way —
+// if it doesn't warm, login just launches fresh. Biggest win on State Farm
+// (headful + proxy); marginal on Lemonade (already fast).
+$('carrier').onchange = async () => {
+  if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
+  try {
+    const r = await api('/api/prewarm', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ carrier: $('carrier').value }),
+    });
+    prewarmSid = r.session_id;
+  } catch (_) { prewarmSid = null; }
+};
+
+$('loginBtn').onclick = async () => {
+  log('logging in…');
+  lat.login = lat.render = null; $('latency').textContent = '';
+  tLogin = performance.now(); tMfa = null;
+  try {
+    const res = await api('/api/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        carrier: $('carrier').value,
+        username: $('username').value,
+        password: $('password').value || null,
+        session_id: prewarmSid,
+      }),
+    });
+    sid = res.session_id;
+    prewarmSid = null;   // consumed — login reused it or launched fresh
+    mfaUsed = !!(res.mfa && res.mfa.required);
+    if (mfaUsed) {
+      setLatency('login', (performance.now() - tLogin) / 1000);
+      $('mfaMsg').textContent = res.mfa.message;
+      $('mfa').classList.remove('hidden');
+      log('');
+    } else {
+      tMfa = tLogin;          // no-MFA carrier: time render from login
+      await loadDocs();
+    }
+  } catch (e) { log('login failed: ' + e.message); }
+};
+
+$('mfaBtn').onclick = async () => {
+  log('verifying code…');
+  tMfa = performance.now();          // 8s-budget clock starts at code submit
+  try {
+    await api('/api/mfa', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: sid, code: $('code').value }),
+    });
+    $('mfa').classList.add('hidden');
+    await loadDocs();
+  } catch (e) { log('mfa failed: ' + e.message); }
+};
+
+// Stop the render clock the first time the PDF actually finishes loading in the
+// viewer after an MFA submit (later doc clicks aren't timed).
+$('viewer').addEventListener('load', () => {
+  if (tMfa != null) {
+    setLatency('render', (performance.now() - tMfa) / 1000);
+    tMfa = null;
+  }
+});
+
+function showDoc(id) {
+  $('viewer').src = '/api/documents/' + id + '/pdf?session_id=' + sid;
+  $('viewer').classList.remove('hidden');
+}
+
+async function loadDocs() {
+  log('fetching documents…');
+  const docs = await api('/api/documents?session_id=' + sid);
+  $('docs').innerHTML = '<h3>Documents</h3>' + (docs.length
+    ? docs.map((d) => `<div class="doc" data-id="${d.doc_id}">${d.title}${d.category ? ' (' + d.category + ')' : ''}</div>`).join('')
+    : '<p>No documents found.</p>');
+  document.querySelectorAll('.doc').forEach((el) => {
+    el.onclick = () => showDoc(el.dataset.id);
+  });
+  if (docs.length) showDoc(docs[0].doc_id);   // auto-render the first doc
+  log('');
+}
+
+// Each page load is a fresh session — close the server-side browser on unload
+// (reload/close) so it doesn't linger until the TTL sweep. sendBeacon survives
+// the page going away; the server endpoint is idempotent.
+window.addEventListener('beforeunload', () => {
+  if (sid) navigator.sendBeacon('/api/session/' + sid + '/close');
+  if (prewarmSid && prewarmSid !== sid) navigator.sendBeacon('/api/session/' + prewarmSid + '/close');
+});
+</script>
+</body>
+</html>
