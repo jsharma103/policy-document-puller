@@ -82,12 +82,20 @@ class StateFarmAdapter:
             pass
 
     async def start_login(self, page: Page, creds: Credentials) -> MfaPrompt:
-        # SF's first load on a fresh mobile IP is slow/flaky, so try the
-        # navigate-and-fill up to twice (reload on the retry).
+        # SF runs through a mobile proxy whose exit node can drop briefly (a real
+        # phone losing signal -> ERR_TUNNEL_CONNECTION_FAILED / 522), and its first
+        # load on a fresh IP is slow. So retry the navigate-and-fill a few times,
+        # tolerating a transient tunnel failure on the nav (it recovers in seconds).
         ok_user = ok_pass = False
-        for attempt in range(2):
-            if attempt > 0 or "login-ui/login" not in page.url:   # prewarm may have navigated
-                await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        nav_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                if attempt > 0 or "login-ui/login" not in page.url:   # prewarm may have navigated
+                    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            except Exception as e:                     # transient proxy-exit drop — wait + retry
+                nav_err = e
+                await page.wait_for_timeout(2000)
+                continue
             try:
                 await page.locator(
                     "input[placeholder='User ID' i], input[type='password']"
@@ -103,6 +111,9 @@ class StateFarmAdapter:
             if ok_user and ok_pass:
                 break
         if not (ok_user and ok_pass):
+            if nav_err and "login-ui/login" not in page.url:   # proxy tunnel kept dropping
+                raise RuntimeError("could not reach State Farm through the mobile "
+                                   f"proxy (transient exit-node drop): {nav_err}")
             try:                                       # capture what SF actually served
                 await page.screenshot(path="/tmp/sf_login_fail.png", full_page=True)
             except Exception:
