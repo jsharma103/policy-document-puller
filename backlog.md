@@ -74,28 +74,42 @@ returning users skip the code.
 
 ---
 
-## Stream / pipeline the auth + rendering to cut perceived latency
+## Stream / pipeline the auth + rendering to cut latency
 
-Idea: overlap and stream the login (username / password / OTP) and the PDF
-rendering instead of strictly sequential steps, to shave time off login + render.
+**Status:** the pipeline angle is DONE; the streaming angles are analyzed + deferred.
 
-Concrete angles:
-- **Progressive PDF streaming.** `fetch_pdf` pulls the full blob, then the
-  frontend loads it into the iframe. Stream the bytes (FastAPI `StreamingResponse`,
-  chunked) so the viewer renders page 1 while the rest downloads — faster
-  perceived render, especially for big multi-page docs.
-- **Pipeline the post-MFA work.** The OAuth token is captured early (at
-  `/v1/token`). Fire `customerMetadata` + the binder fetch *without* waiting out
-  the full passkey/callback/landing chain — overlap the doc fetch with the SSO
-  tail. Caveat: the proxy endpoints may need the callback's session cookies, so
-  firing too early could 401 — needs testing.
-- **Reality check on the credential steps.** The OTP can't be pre-entered (the
-  code is only sent after the creds submit), and the SSO redirects are inherently
-  sequential (each depends on the prior). So the real wins are rendering +
-  overlapping the doc fetch, not the credential typing.
+- **✅ DONE — pipeline the post-MFA work.** `submit_mfa` now returns the moment it
+  captures the `/v1/token` access token and skips the ~4s passkey/callback/landing
+  chain; `list_documents` + `fetch_pdf` run pure-API on that token alone
+  (`_complete_sso` is the bounded fallback if a token-only call 401s). This was the
+  big win — it cut hosted `submit_mfa` from ~5.2s to ~3s.
 
-Why deferred: the flow already meets 8s locally; hosted is proxy-bound (the
-`submit_mfa` SSO chain). These are perceived-latency / margin optimizations.
+- **Deferred — progressive PDF streaming (rendering).** Pipe the blob SF→browser
+  via `StreamingResponse` so page 1 paints while the rest downloads.
+  *Cost/benefit (measured 2026-06-21):* ~1.5–2h for only ~0.2–0.3s off the number.
+  The timer stops on the iframe `load` (all bytes received), so streaming only
+  overlaps the small VM→browser hop — the long pole (`fetch_pdf` ≈ the SF→VM blob
+  download, ~2.5–3.9s, IP-bound) is unchanged. The real benefit is *visual*
+  (progressive paint on a demo), not latency. Also non-trivial: Playwright's
+  `context.request` can't stream, so the blob would have to be refetched over
+  `httpx.stream()` through the mobile proxy (HTTPS CONNECT) — a path that can't be
+  exercised locally (no proxy), so verifying it spends proxy data on new code.
+  Revisit only for demo polish or genuinely large multi-page docs.
+
+- **Deferred — OTP digit streaming.** Send each digit to the carrier's OTP box as
+  the user types it, so `submit_mfa` only submits at click time — moves ~0.7s of
+  keystroke entry *out* of the timed window. The better latency lever of the two
+  (touches `submit_mfa`, no proxy-tunnel risk), but has edge cases: backspace/
+  correction re-sync, and OTP forms that auto-submit on the 6th digit.
+
+- **Credential reality check.** The OTP can't be pre-fetched (the code is only sent
+  after creds submit), and the SSO redirects are inherently sequential. Streaming the
+  username/password fill overlaps with typing, but the login phase isn't in the 8s
+  budget — perceived-only.
+
+Bottom line: the dominant latency lever is **mobile-proxy IP quality** (`fetch_pdf` +
+`submit_mfa` are proxy-bound) — a good sticky IP beats every streaming micro-opt. The
+remaining streaming items are margin/polish.
 
 ---
 
