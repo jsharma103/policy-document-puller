@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Never commit downloaded policy documents or anything account-related
+downloads/
+*.pdf
+
+# Secrets / env (keep the committed template)
+.env
+.env.*
+!.env.example
+
+# Not part of the app: the take-home spec, the exploratory prototype, private notes
+infer_takehome.md
+prototype.py
+FINDINGS.md
+POC_PROMPTS.md
+HANDOFF_PROMPT.md
