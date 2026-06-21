@@ -88,25 +88,25 @@ class StateFarmAdapter:
         # tolerating a transient tunnel failure on the nav (it recovers in seconds).
         ok_user = ok_pass = False
         nav_err: Exception | None = None
-        for attempt in range(3):
-            try:
+        for attempt in range(2):                       # fail fast: 2 tries with tight timeouts so a
+            try:                                        # flaky proxy errors quickly, never hangs ~2min
                 if attempt > 0 or "login-ui/login" not in page.url:   # prewarm may have navigated
-                    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-            except Exception as e:                     # transient proxy-exit drop — wait + retry
+                    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15000)
+            except Exception as e:                     # transient proxy-exit drop — short wait + retry
                 nav_err = e
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1500)
                 continue
             try:
                 await page.locator(
                     "input[placeholder='User ID' i], input[type='password']"
-                ).first.wait_for(state="visible", timeout=25000)
+                ).first.wait_for(state="visible", timeout=12000)
             except Exception:
                 pass
             ok_user = await _fill(page, USER_SELS, creds.username, "User ID")
             # Two-step form: User ID + Continue, then the password screen renders.
             if not await page.locator("input[type='password']").count():
                 await _submit(page)
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1500)      # let the React password screen hydrate
             ok_pass = await _fill(page, PASS_SELS, creds.password or "", "password")
             if ok_user and ok_pass:
                 break
@@ -121,15 +121,19 @@ class StateFarmAdapter:
             raise RuntimeError("login form did not populate (User ID / Password) "
                                "— see /tmp/sf_login_fail.png")
 
+        await _check_remember(page)               # opt into device trust (skip MFA next login)
         await _submit(page)
         # Prototype pattern: detect the choose-method screen by its body text and
         # fire the pick EXACTLY ONCE (set the flag before calling, so a re-click
         # never toggles the radio back off). OTP screen reached = otp box present
-        # or we're on /login-ui/vc.
+        # or we're on /login-ui/vc. If we land on my.statefarm.com first, the
+        # device was trusted and Okta skipped MFA entirely.
         picked = False
-        for _ in range(40):                       # ~20s through step-up -> OTP
-            await page.wait_for_timeout(500)
+        for _ in range(80):                       # ~20s through step-up -> OTP (finer 250ms poll)
+            await page.wait_for_timeout(250)
             await _dismiss_passkey(page)
+            if page.url.startswith("https://my.statefarm.com"):    # trusted device -> MFA skipped
+                return MfaPrompt(required=False)
             if await _otp_present(page) or "login-ui/vc" in page.url.lower():
                 return MfaPrompt(required=True,
                                  message="Enter the code State Farm texted you.")
@@ -176,12 +180,12 @@ class StateFarmAdapter:
         """Dismiss the passkey-enroll screen and wait to land on my.statefarm.com
         (the OAuth callback that sets the session cookies). Needed only when the
         pure-API doc flow can't run on the captured token alone."""
-        if "my.statefarm.com" in page.url:
+        if page.url.startswith("https://my.statefarm.com"):
             return
         for _ in range(90):                         # up to ~18s through redirects
             await page.wait_for_timeout(200)
             await _dismiss_passkey(page)
-            if "my.statefarm.com" in page.url:
+            if page.url.startswith("https://my.statefarm.com"):
                 return
         raise RuntimeError("did not reach my.statefarm.com after MFA (SSO stalled)")
 
@@ -321,6 +325,39 @@ class StateFarmAdapter:
 
 
 # --------------------------------------------------------------------------- #
+async def _check_remember(page: Page) -> None:
+    """Check State Farm's custom <sf-checkbox id="rememberDevice"> (unchecked by
+    default) so Okta sets the device-trust cookie. It's a web component, so a
+    plain .check() fails — click the host / label / inner control and verify via
+    the reflected `checked` attribute after each try."""
+    box = page.locator("#rememberDevice").first
+    if not await box.count():
+        print("  [sf] remember-me checkbox not found", flush=True)
+        return
+
+    async def on() -> bool:
+        try:
+            return await box.evaluate(
+                "el => el.checked === true || el.hasAttribute('checked')")
+        except Exception:
+            return False
+
+    if await on():
+        print("  [sf] remember-me already on", flush=True)
+        return
+    for target in ("#rememberDevice",
+                   "label[for='rememberDevice']",
+                   "#rememberDevice input, #rememberDevice [role=checkbox]"):
+        try:
+            await page.locator(target).first.click(timeout=1500)
+            if await on():
+                print("  [sf] remember-me enabled", flush=True)
+                return
+        except Exception:
+            continue
+    print("  [sf] could NOT enable remember-me", flush=True)
+
+
 async def _fill(page: Page, selectors, value: str, label: str) -> bool:
     """Fill + VERIFY (React inputs drop programmatic values); retype as real
     keystrokes if needed."""

@@ -30,6 +30,10 @@
 <input id="password" type="password" autocomplete="off">
 </div>
 
+<div id="rememberRow">
+<label><input type="checkbox" id="remember"> Remember this device (skip MFA next login)</label>
+</div>
+
 <button id="loginBtn">Log in</button>
 
 <div id="mfa" class="hidden">
@@ -94,10 +98,15 @@ async function api(url, opts) {
 
 // Passwordless carriers (email + OTP only) — hide the password field for them.
 const PASSWORDLESS = ['lemonade'];
+const DEVICE_TRUST = ['statefarm'];   // carriers that support remember-this-device (skip MFA)
 function syncPwField() {
-  const off = PASSWORDLESS.includes($('carrier').value);
+  const c = $('carrier').value;
+  const off = PASSWORDLESS.includes(c);
   $('pwRow').style.display = off ? 'none' : '';
   if (off) $('password').value = '';
+  const dt = DEVICE_TRUST.includes(c);
+  $('rememberRow').style.display = dt ? '' : 'none';
+  if (!dt) $('remember').checked = false;
 }
 
 (async () => {
@@ -136,6 +145,7 @@ $('loginBtn').onclick = async () => {
         username: $('username').value,
         password: $('password').value || null,
         session_id: prewarmSid,
+        remember: $('remember').checked,
       }),
     });
     sid = res.session_id;

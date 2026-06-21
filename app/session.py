@@ -23,6 +23,8 @@ class Session:
     authenticated: bool = False
     docs: list[DocMeta] = field(default_factory=list)
     last_used: float = field(default_factory=time.time)
+    remember: bool = False          # opt-in: persist device trust to skip MFA next time
+    state_path: str | None = None   # where this session's storage_state is saved
 
 
 class SessionStore:

@@ -14,6 +14,10 @@ def _env(key: str, default: str | None = None) -> str | None:
 
 SESSION_TTL = int(_env("SESSION_TTL", "600"))  # inactivity seconds
 
+# Where opt-in "remember this device" persists a carrier's storage_state (the
+# device-trust cookie). Ephemeral by default; mount a volume for true persistence.
+STATE_DIR = _env("STATE_DIR", "/tmp/pdp_state")
+
 # Override a carrier's headless default (e.g. watch a run locally). Adapters set
 # their own default; this wins if set to "0"/"1".
 HEADLESS_OVERRIDE = _env("HEADLESS")

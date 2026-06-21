@@ -28,7 +28,7 @@ async def _patchright():
 
 @dataclass
 class Browser:
-    pw_browser: PWBrowser
+    pw_browser: PWBrowser | None     # None for a persistent context (closing it stops the browser)
     context: BrowserContext
     page: Page
 
@@ -36,10 +36,16 @@ class Browser:
         try:
             await self.context.close()
         finally:
-            await self.pw_browser.close()
+            if self.pw_browser is not None:
+                await self.pw_browser.close()
 
 
-async def launch(spec: LaunchSpec) -> Browser:
+async def launch(spec: LaunchSpec, storage_state: str | None = None,
+                 user_data_dir: str | None = None) -> Browser:
+    """Launch a browser + context for a carrier. `user_data_dir` uses a PERSISTENT
+    profile — cookies + localStorage + IndexedDB + fingerprint all survive across
+    runs, like a real browser — so Okta device trust holds for opt-in remember-
+    this-device (plain `storage_state` cookies alone aren't enough for Okta)."""
     pw = await _patchright()
     headless = spec.headless
     if config.HEADLESS_OVERRIDE in ("0", "1"):
@@ -59,8 +65,21 @@ async def launch(spec: LaunchSpec) -> Browser:
             print("[browser] no SOAX proxy set — running DIRECT egress "
                   "(ok locally on a residential IP, not from the droplet)")
 
+    if user_data_dir:
+        # Persistent profile: the whole browser state persists to user_data_dir,
+        # so a trusted device stays trusted across logins (Okta device cookie +
+        # whatever else it binds to). First login writes it; later ones reuse it.
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir, accept_downloads=True, **launch_kwargs)
+        await context.add_init_script(_WEBDRIVER_MASK)
+        page = context.pages[0] if context.pages else await context.new_page()
+        return Browser(pw_browser=None, context=context, page=page)
+
     browser = await pw.chromium.launch(**launch_kwargs)
-    context = await browser.new_context(accept_downloads=True)
+    ctx_kwargs: dict = {"accept_downloads": True}
+    if storage_state:                     # restore a saved authed session (remember-this-device)
+        ctx_kwargs["storage_state"] = storage_state
+    context = await browser.new_context(**ctx_kwargs)
     await context.add_init_script(_WEBDRIVER_MASK)
     page = await context.new_page()
     return Browser(pw_browser=browser, context=context, page=page)
