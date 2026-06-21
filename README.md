@@ -31,13 +31,19 @@ Open http://localhost:8000 → pick a carrier → enter portal credentials → e
 the MFA code when prompted → the policy document renders.
 
 Notes:
-- **Lemonade** runs headless and needs no configuration.
+- **No `.env` is required to run.** The only setting is `SOAX_*` and it's
+  optional — it's the mobile proxy State Farm needs *from a datacenter/server IP*.
+  Unset, State Farm just goes direct (fine on a residential connection), and
+  Lemonade/Goodcover never use it. So `git clone` → the four commands above →
+  it boots.
+- **Lemonade** and **Goodcover** run headless and need no configuration.
 - **State Farm** runs **headful** (it detects headless — see below), so a Chrome
-  window opens locally. On a residential IP it needs no proxy; from a
-  datacenter/server it needs the SOAX mobile proxy (`cp .env.example .env`, fill
-  `SOAX_USER`/`SOAX_PASS`, and export them — e.g. `set -a; . .env; set +a`).
-- Carrier credentials are typed into the browser, used in memory, and never
-  written to disk or logged. The MFA code is supplied by the user at runtime.
+  window opens locally. Residential IP → no proxy; datacenter/server → set the
+  SOAX proxy (`cp .env.example .env`, fill `SOAX_USER`/`SOAX_PASS`,
+  `set -a; . .env; set +a`).
+- You supply carrier credentials at runtime — typed into the browser, used in
+  memory, never written to disk or logged (the MFA code too). To exercise a
+  carrier you need an account on it; the **Loom** shows a full run on real policies.
 
 ---
 
