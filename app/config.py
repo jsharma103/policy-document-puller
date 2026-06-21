@@ -1,21 +1,33 @@
 """App settings. All secrets come from the environment — never code or disk."""
 import os
 
-SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))  # inactivity seconds
+
+def _env(key: str, default: str | None = None) -> str | None:
+    """Read an env var, tolerating surrounding quotes. `docker --env-file` passes
+    `KEY="val"` through literally (unlike shell `source`, which strips quotes), so
+    stripping here makes a quoted .env work the same either way."""
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    return v.strip().strip('"').strip("'")
+
+
+SESSION_TTL = int(_env("SESSION_TTL", "600"))  # inactivity seconds
 
 # Override a carrier's headless default (e.g. watch a run locally). Adapters set
 # their own default; this wins if set to "0"/"1".
-HEADLESS_OVERRIDE = os.environ.get("HEADLESS")
+HEADLESS_OVERRIDE = _env("HEADLESS")
 
 
 def soax_proxy() -> dict | None:
-    """SOAX mobile proxy for carriers that need mobile egress (State Farm).
-    Returns a Playwright proxy dict, or None if not configured. Creds are env-
-    only; rotation params live in SOAX_USER (…-sessionid-<id>-sessionlength-…)."""
-    user = os.environ.get("SOAX_USER")
-    password = os.environ.get("SOAX_PASS")
+    """Mobile proxy for carriers that need mobile egress (State Farm). Returns a
+    Playwright proxy dict, or None if not configured. Creds are env-only; the
+    SOAX_ prefix is historical — any HTTP proxy provider works (SOAX, Decodo, …),
+    and rotation/session params live inside SOAX_USER."""
+    user = _env("SOAX_USER")
+    password = _env("SOAX_PASS")
     if not (user and password):
         return None
-    host = os.environ.get("SOAX_HOST", "proxy.soax.com")
-    port = os.environ.get("SOAX_PORT", "5000")
+    host = _env("SOAX_HOST", "proxy.soax.com")
+    port = _env("SOAX_PORT", "5000")
     return {"server": f"http://{host}:{port}", "username": user, "password": password}
