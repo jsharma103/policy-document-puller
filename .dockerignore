@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+.env.*
+downloads/
+*.pdf
+.git/
+.gitignore
+backlog.md
