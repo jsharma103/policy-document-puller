@@ -45,6 +45,17 @@ Notes:
   memory, never written to disk or logged (the MFA code too). To exercise a
   carrier you need an account on it; the **Loom** shows a full run on real policies.
 
+### Or with Docker
+
+```bash
+docker build -t policy-puller .
+docker run --rm -p 8000:8000 policy-puller
+#   add -e SOAX_USER=… -e SOAX_PASS=…  for State Farm from a non-residential host
+```
+
+Same app on http://localhost:8000 — Xvfb (for State Farm's headful browser) and
+the stealth Chromium are baked in. (Verified: builds, boots, serves all three.)
+
 ---
 
 ## Architecture

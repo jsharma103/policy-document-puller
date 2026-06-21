@@ -25,10 +25,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY app ./app
 COPY frontend ./frontend
+COPY entrypoint.sh ./
 
 EXPOSE 8000
 
-# Whole server under a virtual display (State Farm headful; Lemonade headless
-# ignores it). Use exec form so signals reach uvicorn.
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", \
-     "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# entrypoint.sh brings up Xvfb (State Farm is headful) then exec's uvicorn.
+# (Running `xvfb-run` as PID 1 misbehaves in a container — it starts Xvfb but
+# never launches the command.)
+CMD ["sh", "/app/entrypoint.sh"]
