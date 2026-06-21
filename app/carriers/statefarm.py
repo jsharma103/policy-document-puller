@@ -82,23 +82,33 @@ class StateFarmAdapter:
             pass
 
     async def start_login(self, page: Page, creds: Credentials) -> MfaPrompt:
-        if "login-ui/login" not in page.url:          # skip if prewarm already navigated
-            await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        try:
-            await page.locator(
-                "input[placeholder='User ID' i], input[type='password']"
-            ).first.wait_for(state="visible", timeout=15000)
-        except Exception:
-            pass
-
-        ok_user = await _fill(page, USER_SELS, creds.username, "User ID")
-        # Two-step form: User ID + Continue, then the password screen renders.
-        if not await page.locator("input[type='password']").count():
-            await _submit(page)
-            await page.wait_for_timeout(1500)
-        ok_pass = await _fill(page, PASS_SELS, creds.password or "", "password")
+        # SF's first load on a fresh mobile IP is slow/flaky, so try the
+        # navigate-and-fill up to twice (reload on the retry).
+        ok_user = ok_pass = False
+        for attempt in range(2):
+            if attempt > 0 or "login-ui/login" not in page.url:   # prewarm may have navigated
+                await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            try:
+                await page.locator(
+                    "input[placeholder='User ID' i], input[type='password']"
+                ).first.wait_for(state="visible", timeout=25000)
+            except Exception:
+                pass
+            ok_user = await _fill(page, USER_SELS, creds.username, "User ID")
+            # Two-step form: User ID + Continue, then the password screen renders.
+            if not await page.locator("input[type='password']").count():
+                await _submit(page)
+                await page.wait_for_timeout(1500)
+            ok_pass = await _fill(page, PASS_SELS, creds.password or "", "password")
+            if ok_user and ok_pass:
+                break
         if not (ok_user and ok_pass):
-            raise RuntimeError("login form did not populate (User ID / Password)")
+            try:                                       # capture what SF actually served
+                await page.screenshot(path="/tmp/sf_login_fail.png", full_page=True)
+            except Exception:
+                pass
+            raise RuntimeError("login form did not populate (User ID / Password) "
+                               "— see /tmp/sf_login_fail.png")
 
         await _submit(page)
         # Prototype pattern: detect the choose-method screen by its body text and
