@@ -25,8 +25,10 @@
 <label>Username / email</label>
 <input id="username" autocomplete="off">
 
-<label>Password <small>(leave blank for passwordless carriers)</small></label>
+<div id="pwRow">
+<label>Password</label>
 <input id="password" type="password" autocomplete="off">
+</div>
 
 <button id="loginBtn">Log in</button>
 
@@ -90,9 +92,18 @@ async function api(url, opts) {
   return r.json();
 }
 
+// Passwordless carriers (email + OTP only) — hide the password field for them.
+const PASSWORDLESS = ['lemonade'];
+function syncPwField() {
+  const off = PASSWORDLESS.includes($('carrier').value);
+  $('pwRow').style.display = off ? 'none' : '';
+  if (off) $('password').value = '';
+}
+
 (async () => {
   const cs = await api('/api/carriers');
   $('carrier').innerHTML = cs.map((c) => `<option>${c}</option>`).join('');
+  syncPwField();
 })();
 
 // Pre-warm the selected carrier (launch browser + load its login page) the
@@ -102,6 +113,7 @@ async function api(url, opts) {
 // (headful + proxy); marginal on Lemonade (already fast).
 $('carrier').onchange = async () => {
   resetUI();
+  syncPwField();
   if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
   try {
     const r = await api('/api/prewarm', {
