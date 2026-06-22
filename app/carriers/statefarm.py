@@ -111,6 +111,7 @@ class StateFarmAdapter:
         if not token:
             raise RuntimeError("could not mint State Farm WAF token")   # -> browser fallback
         api.http.cookies.set("aws-waf-token", token, domain=".statefarm.com")
+        api.data["aws_waf_token"] = token        # reused by the direct doc-fetch session
         api.data["waf_minted"] = True
 
     async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
@@ -124,24 +125,41 @@ class StateFarmAdapter:
         _ctx_auth[id(api)] = f"Bearer {tok}"
         print("  [sf] API login complete (OAuth token captured)", flush=True)
 
+    def _doc_session(self, api: ApiSession):
+        """Non-proxied curl_cffi session for the document APIs. They're Bearer-
+        authed and accept the VM's datacenter IP directly (verified), so skipping
+        the proxy here cuts MFA->document from ~6s to ~1s on the server. Reused
+        across list + fetch; closed by ApiSession.close()."""
+        d = api.data.get("doc_http")
+        if d is None:
+            from curl_cffi.requests import AsyncSession
+            d = AsyncSession(impersonate="chrome")
+            tok = api.data.get("aws_waf_token")
+            if tok:
+                d.cookies.set("aws-waf-token", tok, domain=".statefarm.com")
+            api.data["doc_http"] = d
+        return d
+
     async def _api_list_documents(self, api: ApiSession) -> list[DocMeta]:
         auth = _ctx_auth.get(id(api))
         if not auth:
             raise RuntimeError("no OAuth token for this session")
-        r = await api.http.get(f"{_DC_PROXY}/customerMetadata?year=0",
-                               headers={"authorization": auth}, timeout=30)
+        http = self._doc_session(api)
+        r = await http.get(f"{_DC_PROXY}/customerMetadata?year=0",
+                           headers={"authorization": auth}, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(f"customerMetadata -> {r.status_code}")
         docs = _extract_docs(r.json())
         if not docs:
             raise RuntimeError("no documents found in customerMetadata")
-        print("  [sf] list_documents via direct API (no browser)", flush=True)
+        print("  [sf] list_documents via direct API (no proxy, no browser)", flush=True)
         return docs
 
     async def _api_fetch_pdf(self, api: ApiSession, doc: DocMeta) -> bytes:
         auth = _ctx_auth.get(id(api))
         headers = {"authorization": auth}
-        r = await api.http.get(
+        http = self._doc_session(api)
+        r = await http.get(
             f"{_DC_PROXY}/document?documentId={doc.extra['documentId']}&commId={doc.extra['commId']}",
             headers=headers, timeout=30)
         if r.status_code != 200:
@@ -154,10 +172,10 @@ class StateFarmAdapter:
         blob_url = (f"{_DOC_INFO_SVC}/blob/{cust}?filter[authToken]={token}"
                     f"&filter[consumerIdentification]=DocumentCenterUI"
                     f"&filter[cachePrefix]=docproxy:doc:")
-        rb = await api.http.get(blob_url, timeout=30)        # one-time authToken in query
+        rb = await http.get(blob_url, timeout=30)        # one-time authToken in query
         body = rb.content
         if body[:5] != b"%PDF-":
-            rb = await api.http.get(blob_url, headers=headers, timeout=30)
+            rb = await http.get(blob_url, headers=headers, timeout=30)
             body = rb.content
         if body[:5] != b"%PDF-":
             raise RuntimeError(f"blob -> {rb.status_code}, not a PDF")

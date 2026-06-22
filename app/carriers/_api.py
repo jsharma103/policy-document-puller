@@ -24,7 +24,10 @@ class ApiSession:
         self.data: dict = {}     # carrier scratch: CSRF / stateHandle / code_verifier
 
     async def close(self) -> None:
-        try:
-            await self.http.close()
-        except Exception:
-            pass
+        # close the main session plus any extra session an adapter stashed in
+        # .data (e.g. State Farm's direct, non-proxied document-fetch session)
+        for s in [self.http, *(v for v in self.data.values() if isinstance(v, AsyncSession))]:
+            try:
+                await s.close()
+            except Exception:
+                pass
