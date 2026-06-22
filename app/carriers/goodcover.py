@@ -12,6 +12,7 @@ import re
 from playwright.async_api import BrowserContext, Page
 
 from .base import Credentials, DocMeta, Egress, LaunchSpec, MfaPrompt
+from ._util import click_first_visible, pdf_via_request
 
 LOGIN_URL = "https://app.goodcover.com/login?msg=auth&return_url=%2Fdashboard"
 
@@ -42,13 +43,13 @@ class GoodcoverAdapter:
         await email.wait_for(state="visible", timeout=20000)
         await email.click()
         await email.fill(creds.username)
-        await _click(page, _NEXT_SELS)
+        await click_first_visible(page, _NEXT_SELS, timeout=3000)
         # Step 2: password → Log in
         pw = page.locator(", ".join(_PASS_SELS)).first
         await pw.wait_for(state="visible", timeout=15000)
         await pw.click()
         await pw.fill(creds.password or "")
-        await _click(page, _LOGIN_SELS)
+        await click_first_visible(page, _LOGIN_SELS, timeout=3000)
         # Logged in once we leave /login (return_url sends us to /dashboard).
         for _ in range(50):                            # up to ~20s
             if "/login" not in page.url:
@@ -86,22 +87,4 @@ class GoodcoverAdapter:
                         extra={"href": href})]
 
     async def fetch_pdf(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
-        r = await context.request.get(doc.extra["href"])
-        if not r.ok:
-            raise RuntimeError(f"policy PDF link returned {r.status}")
-        body = await r.body()
-        if body[:5] != b"%PDF-":
-            raise RuntimeError("Download Policy href did not return a PDF")
-        return body
-
-
-async def _click(page: Page, selectors) -> None:
-    for sel in selectors:
-        loc = page.locator(sel).first
-        try:
-            if await loc.is_visible():
-                await loc.click(timeout=3000)
-                return
-        except Exception:
-            continue
-    await page.keyboard.press("Enter")
+        return await pdf_via_request(context, doc.extra["href"], "policy PDF link")

@@ -1,6 +1,6 @@
 """State Farm adapter — the hard carrier.
 
-Real bot detection → patchright + real Chrome (channel="chrome", no_viewport),
+Real bot detection → patchright + its bundled Chromium (no channel="chrome"),
 headful (run under Xvfb on the server). Mobile/4G egress (SOAX) because State
 Farm fake-rejects datacenter IPs as "incorrect user ID or password". After the
 SMS code there's a multi-domain OAuth/SSO chain before documents are reachable,
@@ -18,6 +18,7 @@ import re
 from playwright.async_api import BrowserContext, Page
 
 from .base import Credentials, DocMeta, Egress, LaunchSpec, MfaPrompt
+from ._util import click_first_visible
 
 LOGIN_URL = ("https://auth.proofing.statefarm.com/login-ui/login"
              "?goto=https%3A%2F%2Fmy.statefarm.com%2F")
@@ -105,7 +106,7 @@ class StateFarmAdapter:
             ok_user = await _fill(page, USER_SELS, creds.username, "User ID")
             # Two-step form: User ID + Continue, then the password screen renders.
             if not await page.locator("input[type='password']").count():
-                await _submit(page)
+                await click_first_visible(page, SUBMIT_SELS)
                 await page.wait_for_timeout(1500)
             ok_pass = await _fill(page, PASS_SELS, creds.password or "", "password")
             if ok_user and ok_pass:
@@ -121,7 +122,7 @@ class StateFarmAdapter:
             raise RuntimeError("login form did not populate (User ID / Password) "
                                "— see /tmp/sf_login_fail.png")
 
-        await _submit(page)
+        await click_first_visible(page, SUBMIT_SELS)
         # Prototype pattern: detect the choose-method screen by its body text and
         # fire the pick EXACTLY ONCE (set the flag before calling, so a re-click
         # never toggles the radio back off). OTP screen reached = otp box present
@@ -159,7 +160,7 @@ class StateFarmAdapter:
             async with page.expect_response(
                     lambda r: "/v1/token" in r.url.lower() and r.request.method == "POST",
                     timeout=15000) as info:
-                await _submit(page)
+                await click_first_visible(page, SUBMIT_SELS)
             data = await (await info.value).json()
             tok = data.get("access_token")
             if tok:
@@ -341,18 +342,6 @@ async def _fill(page: Page, selectors, value: str, label: str) -> bool:
         except Exception:
             continue
     return False
-
-
-async def _submit(page: Page) -> None:
-    for sel in SUBMIT_SELS:
-        loc = page.locator(sel).first
-        try:
-            if await loc.is_visible():
-                await loc.click(timeout=2000)
-                return
-        except Exception:
-            continue
-    await page.keyboard.press("Enter")
 
 
 async def _pick_code_method(page: Page) -> bool:

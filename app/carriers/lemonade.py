@@ -9,6 +9,7 @@ proxy needed.
 from playwright.async_api import BrowserContext, Page
 
 from .base import Credentials, DocMeta, Egress, LaunchSpec, MfaPrompt
+from ._util import click_first_visible, pdf_via_request
 
 LOGIN_URL = "https://www.lemonade.com/login"
 POLICIES_API = "https://my.lemonade.com/api/v1/web_dashboard/accounts/home/policies"
@@ -43,7 +44,7 @@ class LemonadeAdapter:
         await email.wait_for(state="visible", timeout=20000)
         await email.click()
         await email.fill(creds.username)
-        await _submit(page)
+        await click_first_visible(page, _SUBMIT_SELS)
         try:
             await page.locator(", ".join(_OTP_SELS)).first.wait_for(
                 state="visible", timeout=20000)
@@ -57,7 +58,7 @@ class LemonadeAdapter:
         await box.wait_for(state="visible", timeout=10000)
         await box.click()
         await page.keyboard.type(code, delay=120)   # real keystrokes across 6 boxes
-        await _submit(page)
+        await click_first_visible(page, _SUBMIT_SELS)
         # The code field detaches once Lemonade accepts the code.
         try:
             await page.locator(_OTP_SELS[0]).first.wait_for(state="detached", timeout=10000)
@@ -74,25 +75,7 @@ class LemonadeAdapter:
         return docs
 
     async def fetch_pdf(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
-        r = await context.request.get(doc.extra["form_url"])
-        if not r.ok:
-            raise RuntimeError(f"form_url returned {r.status}")
-        body = await r.body()
-        if body[:5] != b"%PDF-":
-            raise RuntimeError("form_url did not return a PDF")
-        return body
-
-
-async def _submit(page: Page) -> None:
-    for sel in _SUBMIT_SELS:
-        loc = page.locator(sel).first
-        try:
-            if await loc.is_visible():
-                await loc.click(timeout=2000)
-                return
-        except Exception:
-            continue
-    await page.keyboard.press("Enter")
+        return await pdf_via_request(context, doc.extra["form_url"], "form_url")
 
 
 def _extract_docs(data) -> list[DocMeta]:
