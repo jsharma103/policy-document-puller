@@ -1,24 +1,30 @@
-"""State Farm adapter — the hard carrier.
+"""State Farm adapter — the hard carrier, now hybrid.
 
-Real bot detection → patchright + its bundled Chromium (no channel="chrome"),
-headful (run under Xvfb on the server). Mobile/4G egress (SOAX) because State
-Farm fake-rejects datacenter IPs as "incorrect user ID or password". After the
-SMS code there's a multi-domain OAuth/SSO chain before documents are reachable,
-and the Document Center is a separate SPA with its own handshake.
+State Farm's login is an Okta IDX JSON API gated by AWS WAF Bot Control on the
+credential step. Two transports behind one adapter:
 
-Doc fetch: the Document Center's `customerMetadata` API lists docs (we pick the
-policy BINDER, not the legacy notification). Deep-link the viewer once the SPA
-is warm; the page lands on the `documentinformationservice` URL, which we fetch
-through the live authed context (the bare blob endpoint 401s).
+  * API (default, fast): a brief stealth browser mints the one `aws-waf-token`
+    the WAF demands (~2-3s), then the whole Okta IDX flow + document APIs run over
+    curl_cffi (see _sf_idx). MFA→document lands ~1-2s. Mobile/4G egress because
+    State Farm fake-rejects datacenter IPs.
+  * Browser (fallback): the original full Playwright login (headful under Xvfb +
+    mobile proxy), used automatically if the API path fails (main.py retries it).
 
-See the carrier-flow findings for the full reasoning.
+After auth, documents are pulled straight from the Document Center proxy/blob
+APIs with the captured OAuth Bearer — no SPA. Doc ids/links discovered at runtime.
+
+Each lifecycle method dispatches on the transport it's handed (ApiSession vs a
+Playwright page/context).
 """
 import re
 
 from playwright.async_api import BrowserContext, Page
 
-from .base import Credentials, DocMeta, Egress, LaunchSpec, MfaPrompt
+from .. import config
+from . import _sf_idx
+from ._api import ApiSession
 from ._util import click_first_visible
+from .base import Credentials, DocMeta, Egress, LaunchSpec, MfaPrompt
 
 LOGIN_URL = ("https://auth.proofing.statefarm.com/login-ui/login"
              "?goto=https%3A%2F%2Fmy.statefarm.com%2F")
@@ -38,8 +44,8 @@ _DC_PROXY = ("https://documentcenterproxyv1-prod-custdocmgmtweb.apps.gdrosa."
              "redk8s.statefarm.com/DocumentCenterProxyV1")
 _DOC_INFO_SVC = ("https://documentinformationservice-prod-custdocmgmtweb.apps."
                  "gdrosa.redk8s.statefarm.com/DocumentInformationService")
-# Bearer token the SPA sends to the doc APIs, captured per browser context from
-# its own customerMetadata request and reused for the direct PDF fetch.
+# Bearer token for the doc APIs, keyed by the live session object (Playwright
+# context for the browser path, ApiSession for the API path).
 _ctx_auth: dict[int, str] = {}
 
 USER_SELS = ("#input", "input[autocomplete~='username']",
@@ -53,8 +59,6 @@ OTP_SELS = ("input[autocomplete='one-time-code']", "input[name*='code' i]",
             "input[id*='code' i]", "input[aria-label*='code' i]",
             "input[inputmode='numeric']", "input[type='tel']",
             "input[maxlength='6']", "input[maxlength]")
-# State Farm's Verify control is an input[type=submit], NOT a button — match
-# both so we don't fall back to the flaky Enter key.
 SUBMIT_SELS = ("input[type=submit]", "button[type=submit]",
                "button:has-text('Continue')", "button:has-text('Verify')",
                "button:has-text('Log in')", "button:has-text('Submit')")
@@ -62,18 +66,92 @@ SUBMIT_SELS = ("input[type=submit]", "button[type=submit]",
 
 class StateFarmAdapter:
     name = "statefarm"
-    # Match the proven prototype exactly: patchright's bundled Chromium (NO
-    # channel="chrome") at the default 1280x720 viewport (NO no_viewport). The
-    # earlier channel/no_viewport overrides changed SF's responsive layout and
-    # broke the step-up clicks.
-    launch = LaunchSpec(headless=False, egress=Egress.MOBILE_PROXY)
+    # API-default hybrid; headful + mobile proxy kept on the spec so the browser
+    # FALLBACK (main.py relaunches with transport="browser") runs the proven flow.
+    launch = LaunchSpec(headless=False, egress=Egress.MOBILE_PROXY, transport="api")
 
-    async def prewarm(self, page: Page) -> None:
-        """Optional speedup: navigate to the login page (the slow part — loading
-        State Farm's login + stealth settle through the mobile proxy) ahead of
-        time, while the user is still typing credentials. start_login then skips
-        the nav and fills creds immediately. Best-effort; failure just means
-        login navigates fresh."""
+    # ---- transport dispatch ---- #
+    async def prewarm(self, page) -> None:
+        if isinstance(page, ApiSession):
+            return                                   # API path mints at login time
+        await self._browser_prewarm(page)
+
+    async def start_login(self, page, creds: Credentials) -> MfaPrompt:
+        if isinstance(page, ApiSession):
+            return await self._api_start_login(page, creds)
+        return await self._browser_start_login(page, creds)
+
+    async def submit_mfa(self, page, code: str) -> None:
+        if isinstance(page, ApiSession):
+            return await self._api_submit_mfa(page, code)
+        return await self._browser_submit_mfa(page, code)
+
+    async def list_documents(self, context, page) -> list[DocMeta]:
+        if isinstance(context, ApiSession):
+            return await self._api_list_documents(context)
+        return await self._browser_list_documents(context, page)
+
+    async def fetch_pdf(self, context, page, doc: DocMeta) -> bytes:
+        if isinstance(context, ApiSession):
+            return await self._api_fetch_pdf(context, doc)
+        return await self._browser_fetch_pdf(context, page, doc)
+
+    # ---- API transport (default): browser-minted WAF token + curl_cffi IDX ---- #
+    async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
+        token = await _sf_idx.mint_waf_token(config.soax_proxy())   # None locally -> direct
+        if not token:
+            raise RuntimeError("could not mint State Farm WAF token")   # -> browser fallback
+        api.http.cookies.set("aws-waf-token", token, domain=".statefarm.com")
+        await _sf_idx.start(api.http, api.data, creds.username, creds.password or "")
+        print("  [sf] API login: password accepted, email OTP requested", flush=True)
+        return MfaPrompt(required=True, message="Enter the code State Farm emailed you.")
+
+    async def _api_submit_mfa(self, api: ApiSession, code: str) -> None:
+        tok = await _sf_idx.finish(api.http, api.data, code)
+        _ctx_auth[id(api)] = f"Bearer {tok}"
+        print("  [sf] API login complete (OAuth token captured)", flush=True)
+
+    async def _api_list_documents(self, api: ApiSession) -> list[DocMeta]:
+        auth = _ctx_auth.get(id(api))
+        if not auth:
+            raise RuntimeError("no OAuth token for this session")
+        r = await api.http.get(f"{_DC_PROXY}/customerMetadata?year=0",
+                               headers={"authorization": auth}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"customerMetadata -> {r.status_code}")
+        docs = _extract_docs(r.json())
+        if not docs:
+            raise RuntimeError("no documents found in customerMetadata")
+        print("  [sf] list_documents via direct API (no browser)", flush=True)
+        return docs
+
+    async def _api_fetch_pdf(self, api: ApiSession, doc: DocMeta) -> bytes:
+        auth = _ctx_auth.get(id(api))
+        headers = {"authorization": auth}
+        r = await api.http.get(
+            f"{_DC_PROXY}/document?documentId={doc.extra['documentId']}&commId={doc.extra['commId']}",
+            headers=headers, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"proxy /document -> {r.status_code}")
+        meta = r.json()
+        cust = _deep_find(meta, ("custindexid",))
+        token = _deep_find(meta, ("authtoken",))
+        if not (cust and token):
+            raise RuntimeError("no custIndexId/authToken in proxy JSON")
+        blob_url = (f"{_DOC_INFO_SVC}/blob/{cust}?filter[authToken]={token}"
+                    f"&filter[consumerIdentification]=DocumentCenterUI"
+                    f"&filter[cachePrefix]=docproxy:doc:")
+        rb = await api.http.get(blob_url, timeout=30)        # one-time authToken in query
+        body = rb.content
+        if body[:5] != b"%PDF-":
+            rb = await api.http.get(blob_url, headers=headers, timeout=30)
+            body = rb.content
+        if body[:5] != b"%PDF-":
+            raise RuntimeError(f"blob -> {rb.status_code}, not a PDF")
+        return body
+
+    # ---- Browser transport (fallback): the original full Playwright login ---- #
+    async def _browser_prewarm(self, page: Page) -> None:
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
         try:
             await page.locator(
@@ -82,18 +160,14 @@ class StateFarmAdapter:
         except Exception:
             pass
 
-    async def start_login(self, page: Page, creds: Credentials) -> MfaPrompt:
-        # SF runs through a mobile proxy whose exit node can drop briefly (a real
-        # phone losing signal -> ERR_TUNNEL_CONNECTION_FAILED / 522), and its first
-        # load on a fresh IP is slow. So retry the navigate-and-fill a few times,
-        # tolerating a transient tunnel failure on the nav (it recovers in seconds).
+    async def _browser_start_login(self, page: Page, creds: Credentials) -> MfaPrompt:
         ok_user = ok_pass = False
         nav_err: Exception | None = None
         for attempt in range(3):
             try:
-                if attempt > 0 or "login-ui/login" not in page.url:   # prewarm may have navigated
+                if attempt > 0 or "login-ui/login" not in page.url:
                     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-            except Exception as e:                     # transient proxy-exit drop — wait + retry
+            except Exception as e:
                 nav_err = e
                 await page.wait_for_timeout(2000)
                 continue
@@ -104,7 +178,6 @@ class StateFarmAdapter:
             except Exception:
                 pass
             ok_user = await _fill(page, USER_SELS, creds.username, "User ID")
-            # Two-step form: User ID + Continue, then the password screen renders.
             if not await page.locator("input[type='password']").count():
                 await click_first_visible(page, SUBMIT_SELS)
                 await page.wait_for_timeout(1500)
@@ -112,10 +185,10 @@ class StateFarmAdapter:
             if ok_user and ok_pass:
                 break
         if not (ok_user and ok_pass):
-            if nav_err and "login-ui/login" not in page.url:   # proxy tunnel kept dropping
+            if nav_err and "login-ui/login" not in page.url:
                 raise RuntimeError("could not reach State Farm through the mobile "
                                    f"proxy (transient exit-node drop): {nav_err}")
-            try:                                       # capture what SF actually served
+            try:
                 await page.screenshot(path="/tmp/sf_login_fail.png", full_page=True)
             except Exception:
                 pass
@@ -123,12 +196,8 @@ class StateFarmAdapter:
                                "— see /tmp/sf_login_fail.png")
 
         await click_first_visible(page, SUBMIT_SELS)
-        # Prototype pattern: detect the choose-method screen by its body text and
-        # fire the pick EXACTLY ONCE (set the flag before calling, so a re-click
-        # never toggles the radio back off). OTP screen reached = otp box present
-        # or we're on /login-ui/vc.
         picked = False
-        for _ in range(40):                       # ~20s through step-up -> OTP
+        for _ in range(40):
             await page.wait_for_timeout(500)
             await _dismiss_passkey(page)
             if await _otp_present(page) or "login-ui/vc" in page.url.lower():
@@ -142,7 +211,7 @@ class StateFarmAdapter:
                     "how do you want", "where should we", "send a code",
                     "send you a code", "receive a code", "get a code",
                     "text message", "verification method", "choose how")):
-                picked = True                     # attempt exactly once
+                picked = True
                 await _pick_code_method(page)
         try:
             await page.screenshot(path="/tmp/sf_stepup_fail.png", full_page=True)
@@ -152,10 +221,8 @@ class StateFarmAdapter:
                            "(bot reject disguised as bad creds, or wrong creds) "
                            "— see /tmp/sf_stepup_fail.png")
 
-    async def submit_mfa(self, page: Page, code: str) -> None:
-        await _enter_otp(page, code)                # prototype's enter_otp logic
-        # Capture the OAuth access token from the post-MFA token exchange so the
-        # doc APIs can be called directly (skip the Document Center SPA).
+    async def _browser_submit_mfa(self, page: Page, code: str) -> None:
+        await _enter_otp(page, code)
         try:
             async with page.expect_response(
                     lambda r: "/v1/token" in r.url.lower() and r.request.method == "POST",
@@ -165,33 +232,22 @@ class StateFarmAdapter:
             tok = data.get("access_token")
             if tok:
                 _ctx_auth[id(page.context)] = f"Bearer {tok}"
-                return   # token in hand — skip the ~4s passkey/callback/landing
-                         # chain. list_documents fires the pure-API doc flow
-                         # immediately and completes the SSO only if that 401s.
+                return
         except Exception:
-            pass   # not captured -> drive the SSO so the SPA path works
-
+            pass
         await self._complete_sso(page)
 
     async def _complete_sso(self, page: Page) -> None:
-        """Dismiss the passkey-enroll screen and wait to land on my.statefarm.com
-        (the OAuth callback that sets the session cookies). Needed only when the
-        pure-API doc flow can't run on the captured token alone."""
         if "my.statefarm.com" in page.url:
             return
-        for _ in range(90):                         # up to ~18s through redirects
+        for _ in range(90):
             await page.wait_for_timeout(200)
             await _dismiss_passkey(page)
             if "my.statefarm.com" in page.url:
                 return
         raise RuntimeError("did not reach my.statefarm.com after MFA (SSO stalled)")
 
-    async def list_documents(self, context: BrowserContext, page: Page) -> list[DocMeta]:
-        # Fast path: call customerMetadata directly with the OAuth token captured
-        # at MFA — skips both the ~4s SSO tail (submit_mfa returned early) AND the
-        # Document Center SPA's ~12 requests. If the token alone isn't enough (the
-        # proxy needs the landing's session cookies), complete the SSO then load
-        # the SPA (which also re-captures the token for fetch_pdf).
+    async def _browser_list_documents(self, context: BrowserContext, page: Page) -> list[DocMeta]:
         try:
             data = await self._customer_metadata_direct(context)
             docs = _extract_docs(data)
@@ -217,9 +273,7 @@ class StateFarmAdapter:
             raise RuntimeError(f"customerMetadata -> {r.status}")
         return await r.json()
 
-    async def fetch_pdf(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
-        # Fast path: two API calls, no SPA. Falls back to driving the viewer if
-        # the direct path ever fails (e.g. SF changes the proxy contract).
+    async def _browser_fetch_pdf(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
         try:
             return await self._fetch_pdf_direct(context, doc)
         except Exception as e:
@@ -245,8 +299,6 @@ class StateFarmAdapter:
                     f"?filter[authToken]={token}"
                     f"&filter[consumerIdentification]=DocumentCenterUI"
                     f"&filter[cachePrefix]=docproxy:doc:")
-        # The blob is on a different domain; its auth is the one-time authToken in
-        # the query, NOT the proxy's Bearer. Try query-only first, then Bearer.
         rb = await context.request.get(blob_url)
         body = await rb.body()
         if body[:5] != b"%PDF-":
@@ -257,7 +309,7 @@ class StateFarmAdapter:
         return body
 
     async def _fetch_pdf_via_viewer(self, context: BrowserContext, page: Page, doc: DocMeta) -> bytes:
-        await self._complete_sso(page)   # the viewer needs the landed session
+        await self._complete_sso(page)
         url = VIEWER_URL.format(documentId=doc.extra["documentId"],
                                 commId=doc.extra["commId"])
         await page.goto(url, wait_until="commit")
@@ -272,19 +324,10 @@ class StateFarmAdapter:
         return body
 
     async def _load_doc_center(self, page: Page):
-        """Load the Document Center and return its customerMetadata JSON (the
-        SPA-warm signal). Retry once if State Farm bounces us back to login
-        before the cross-domain session is fully established."""
-        # Block the per-document preview fetches the Document Center SPA fires on
-        # load — we only need its customerMetadata JSON. Previewing every doc is
-        # slow and pulls all the PDFs; fetch_pdf gets the one we want afterward.
-        # (customerMetadata + the SSO handshake are different endpoints, unaffected.)
         _pat = re.compile(r"documentinformationservice")
         cid = id(page.context)
 
         def _grab_auth(req):
-            # Capture the Bearer token the SPA puts on its doc-API calls so
-            # fetch_pdf can hit the proxy/blob endpoints directly.
             if "documentcenterproxyv1" in req.url or "documentinformationservice" in req.url:
                 a = (req.headers or {}).get("authorization")
                 if a:
@@ -312,7 +355,7 @@ class StateFarmAdapter:
                     last_err = e
                     if attempt == 0 and "login-ui/login" in page.url:
                         await page.goto("https://my.statefarm.com/", wait_until="domcontentloaded")
-                        await page.wait_for_timeout(3000)   # re-warm the session
+                        await page.wait_for_timeout(3000)
                         continue
                     break
             raise RuntimeError(f"could not load the Document Center: {last_err}")
@@ -323,8 +366,6 @@ class StateFarmAdapter:
 
 # --------------------------------------------------------------------------- #
 async def _fill(page: Page, selectors, value: str, label: str) -> bool:
-    """Fill + VERIFY (React inputs drop programmatic values); retype as real
-    keystrokes if needed."""
     for sel in selectors:
         loc = page.locator(sel).first
         try:
@@ -345,9 +386,6 @@ async def _fill(page: Page, selectors, value: str, label: str) -> bool:
 
 
 async def _pick_code_method(page: Page) -> bool:
-    """SF step-up 'select a verification method': pick the phone option, then
-    click Send Code (a <button> OR an <input type=submit>) — with force + JS
-    fallbacks for overlay/actionability quirks."""
     clicked = False
     for t in ("Mobile Phone", "Phone", "Text"):
         for sel in (f"label:has-text('{t}')", f"text={t}"):
@@ -359,11 +397,9 @@ async def _pick_code_method(page: Page) -> bool:
                     break
             except Exception:
                 continue
-        if clicked:                               # pick ONE method, not all three
+        if clicked:
             break
     await page.wait_for_timeout(400)
-    # accessible-name role match first (catches button OR input[type=submit]), then
-    # CSS, then force, then a JS click.
     candidates = [page.get_by_role("button", name=re.compile("send", re.I)).first]
     for sel in ("input[type=submit][value*='Send' i]",
                 "button:has-text('Send Code')", "button:has-text('Send')",
@@ -381,7 +417,7 @@ async def _pick_code_method(page: Page) -> bool:
                 return True
             except Exception:
                 continue
-    try:  # last resort: JS-click anything that says "send code"
+    try:
         return await page.evaluate("""() => {
             const els=[...document.querySelectorAll('button,input[type=submit],a,[role=button]')];
             const el=els.find(e=>/send\\s*code/i.test(e.innerText||e.value||''));
@@ -391,9 +427,6 @@ async def _pick_code_method(page: Page) -> bool:
 
 
 async def _enter_otp(page: Page, code: str) -> None:
-    """Port of the prototype's enter_otp: try the OTP selectors in order, type
-    real keystrokes into the first VISIBLE one; fall back to the first visible
-    text-like input, then to the focused element."""
     for sel in OTP_SELS:
         loc = page.locator(sel).first
         try:
@@ -414,7 +447,7 @@ async def _enter_otp(page: Page, code: str) -> None:
                 return
     except Exception:
         pass
-    await page.keyboard.type(code, delay=120)       # last resort: focused element
+    await page.keyboard.type(code, delay=120)
 
 
 async def _otp_present(page: Page) -> bool:
@@ -441,8 +474,6 @@ async def _dismiss_passkey(page: Page) -> None:
 
 
 def _deep_find(obj, keys: tuple) -> str | None:
-    """First scalar value whose (lowercased) key is in `keys`, searched
-    recursively — robust to where SF nests custIndexId / authToken in the JSON."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k.lower() in keys and isinstance(v, (str, int)):
@@ -460,8 +491,6 @@ def _deep_find(obj, keys: tuple) -> str | None:
 
 
 def _extract_docs(data) -> list[DocMeta]:
-    """Pull doc entries (documentId + communicationId) from customerMetadata and
-    sort the policy BINDER first (the real document)."""
     found: list[dict] = []
 
     def walk(o):
@@ -487,15 +516,11 @@ def _extract_docs(data) -> list[DocMeta]:
     docs.sort(key=_doc_rank)
     print("  [sf] discovered docs (sorted): " +
           " | ".join(f"{d.title}/{d.category}" for d in docs), flush=True)
-    # Show only policy documents — drop billing/payment receipts (rank 3), which
-    # aren't policy docs. Fall back to all if filtering would empty the list.
     policy = [d for d in docs if _doc_rank(d) < 3]
     return policy or docs
 
 
 def _doc_rank(d: DocMeta) -> int:
-    """Policy binder first; billing/payment docs last (so the UI auto-renders the
-    actual policy, not a payment receipt)."""
     s = f"{d.title} {d.category}".lower()
     if "binder" in s:
         return 0

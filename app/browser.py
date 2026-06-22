@@ -49,10 +49,14 @@ class Browser:
 
 async def launch(spec: LaunchSpec) -> Browser:
     if spec.transport == "api":
-        # Browser-free carrier (Lemonade): a curl_cffi session stands in for the
-        # page/context everywhere downstream — no Chromium launched.
+        # API-transport carrier: a curl_cffi session stands in for the page/context
+        # everywhere downstream — no Chromium for the request flow. Routed through
+        # the mobile proxy when the carrier needs it (State Farm), direct otherwise
+        # (Lemonade). State Farm still mints one WAF token via a brief browser
+        # inside its adapter; that's separate from this transport.
         from .carriers._api import ApiSession
-        api = ApiSession()
+        proxy = config.soax_proxy() if spec.egress == Egress.MOBILE_PROXY else None
+        api = ApiSession(proxy=proxy)
         return Browser(pw_browser=None, context=api, page=api)
 
     pw = await _patchright()

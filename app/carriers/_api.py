@@ -1,23 +1,27 @@
-"""Browser-free HTTP transport for carriers whose login is a clean HTTP API.
+"""Browser-free HTTP transport for carriers whose login is (mostly) a clean API.
 
-Some carriers (Lemonade) don't need a real browser at all — their login is a
-handful of JSON calls. A `curl_cffi` AsyncSession impersonating Chrome is enough
-to satisfy the carrier's Cloudflare risk check from a datacenter IP (verified),
-without the cost of launching Chromium.
+A `curl_cffi` AsyncSession impersonating Chrome — enough to satisfy carriers'
+network-layer bot checks without launching Chromium. Lemonade runs entirely on
+it; State Farm runs on it too, after a brief browser mints the one token its WAF
+demands (see statefarm._sf_idx). Optionally routes through the mobile proxy.
 
-`ApiSession` deliberately mirrors the Playwright `Browser`'s role: it's the live,
-per-user session object held across login → MFA → document fetch. The adapter
-stashes carrier scratch (CSRF token, etc.) in `.data` and makes requests through
-`.http`. It's passed everywhere the app would pass a page/context, so the session
-store, endpoints, and teardown are unchanged.
+`ApiSession` mirrors the Playwright `Browser`'s role: the live per-user session
+held across login → MFA → document fetch. Adapters stash scratch in `.data` and
+make requests through `.http`. It's passed everywhere a page/context would be,
+so the session store, endpoints, and teardown are unchanged.
 """
 from curl_cffi.requests import AsyncSession
 
 
 class ApiSession:
-    def __init__(self) -> None:
-        self.http = AsyncSession(impersonate="chrome")
-        self.data: dict = {}     # carrier scratch: CSRF token, etc.
+    def __init__(self, proxy: dict | None = None) -> None:
+        kwargs: dict = {"impersonate": "chrome"}
+        if proxy:                                  # playwright-style {server, username, password}
+            host = proxy["server"].split("://", 1)[-1]
+            url = f"http://{proxy['username']}:{proxy['password']}@{host}"
+            kwargs["proxies"] = {"http": url, "https": url}
+        self.http = AsyncSession(**kwargs)
+        self.data: dict = {}     # carrier scratch: CSRF / stateHandle / code_verifier
 
     async def close(self) -> None:
         try:
