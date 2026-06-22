@@ -16,15 +16,26 @@ tried before it, newest to oldest, with the latency at each stage.
 
 ## State Farm
 
+### The problem — why it can't be pure HTTP
+
+The whole goal is to skip the browser and drive the login as plain HTTP. State
+Farm makes that impossible for one step: its login POST is gated by **AWS WAF Bot
+Control**, which requires an `aws-waf-token` that's **computed by JavaScript
+running in a real browser**. There's no way to mint that token from HTTP alone —
+headless is detected and gets no token, and without it the credential POST is
+silently rejected. So a pure-`curl_cffi` login can't get past the password step.
+Everything *else* in the flow (the Okta IDX exchange, the document APIs) is
+plain HTTP — only the token itself needs a browser.
+
 ### Current — hybrid, ~4.8s combined (~5–8s typical with proxy variance)
 
-A brief stealth browser mints **only** the one JS-computed `aws-waf-token` the AWS
-WAF requires; the entire Okta Identity Engine (IDX) login and the Document Center
-fetch then run as `curl_cffi` HTTP. Login egresses through a mobile proxy (State
-Farm rejects datacenter IPs); the Bearer-authed document APIs are IP-agnostic, so
-they're fetched direct from the VM. The token-mint plus the credential-free login
-steps are pre-warmed off the click, and there's an automatic fallback to the full
-browser flow if any API step fails.
+The hybrid answers exactly that constraint: a brief stealth browser mints **only**
+the one JS-computed `aws-waf-token` the WAF requires, and the entire Okta Identity
+Engine (IDX) login and the Document Center fetch then run as `curl_cffi` HTTP.
+Login egresses through a mobile proxy (State Farm rejects datacenter IPs); the
+Bearer-authed document APIs are IP-agnostic, so they're fetched direct from the VM.
+The token-mint plus the credential-free login steps are pre-warmed off the click,
+and there's an automatic fallback to the full browser flow if any API step fails.
 
 - **Login → MFA prompt: ~1.8s** · **MFA submit → document: ~3.0s**
 
