@@ -111,20 +111,28 @@ function syncPwField() {
 // backend only warms carriers that implement prewarm; best-effort either way —
 // if it doesn't warm, login just launches fresh. Biggest win on State Farm
 // (headful + proxy); marginal on Lemonade (already fast).
-$('carrier').onchange = async () => {
+// Track the warm-up as a promise so login can wait for it — the State Farm mint
+// (the ~2-3s WAF-token browser) runs here, overlapping credential typing, so the
+// Login click only pays for the fast HTTP IDX flow.
+let warming = Promise.resolve();
+$('carrier').onchange = () => {
   resetUI();
   syncPwField();
-  if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
-  try {
-    const r = await api('/api/prewarm', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ carrier: $('carrier').value }),
-    });
-    prewarmSid = r.session_id;
-  } catch (_) { prewarmSid = null; }
+  warming = (async () => {
+    if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
+    try {
+      const r = await api('/api/prewarm', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ carrier: $('carrier').value }),
+      });
+      prewarmSid = r.session_id;
+    } catch (_) { prewarmSid = null; }
+  })();
 };
 
 $('loginBtn').onclick = async () => {
+  log('warming up…');
+  await warming;                     // wait for the prewarm mint so login reuses it (no mint at click)
   log('logging in…');
   lat.login = lat.render = null; $('latency').textContent = '';
   tLogin = performance.now(); tMfa = null;

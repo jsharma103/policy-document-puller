@@ -73,7 +73,11 @@ class StateFarmAdapter:
     # ---- transport dispatch ---- #
     async def prewarm(self, page) -> None:
         if isinstance(page, ApiSession):
-            return                                   # API path mints at login time
+            try:
+                await self._ensure_waf_token(page)   # mint now so the ~2-3s overlaps cred typing
+            except Exception:
+                pass                                 # best-effort; start_login mints if needed
+            return
         await self._browser_prewarm(page)
 
     async def start_login(self, page, creds: Credentials) -> MfaPrompt:
@@ -97,11 +101,20 @@ class StateFarmAdapter:
         return await self._browser_fetch_pdf(context, page, doc)
 
     # ---- API transport (default): browser-minted WAF token + curl_cffi IDX ---- #
-    async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
+    async def _ensure_waf_token(self, api: ApiSession) -> None:
+        """Mint the AWS WAF token via a brief stealth browser and set it on the
+        session. Idempotent: prewarm calls it at carrier-select so the ~2-3s mint
+        overlaps credential typing, and start_login then finds it already done."""
+        if api.data.get("waf_minted"):
+            return
         token = await _sf_idx.mint_waf_token(config.soax_proxy())   # None locally -> direct
         if not token:
             raise RuntimeError("could not mint State Farm WAF token")   # -> browser fallback
         api.http.cookies.set("aws-waf-token", token, domain=".statefarm.com")
+        api.data["waf_minted"] = True
+
+    async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
+        await self._ensure_waf_token(api)            # no-op if prewarm already minted it
         await _sf_idx.start(api.http, api.data, creds.username, creds.password or "")
         print("  [sf] API login: password accepted, email OTP requested", flush=True)
         return MfaPrompt(required=True, message="Enter the code State Farm emailed you.")
