@@ -120,6 +120,9 @@ function syncPwField() {
 // backend only warms carriers that implement prewarm; best-effort either way —
 // if it doesn't warm, login just launches fresh. Biggest win on State Farm
 // (headful + proxy); marginal on Lemonade (already fast).
+// Warm on carrier pick. If this carrier already has a trusted profile, the
+// backend warms THAT persistent profile right here, so login reuses it → skip
+// MFA in a single window (no launch at click).
 $('carrier').onchange = async () => {
   resetUI();
   syncPwField();

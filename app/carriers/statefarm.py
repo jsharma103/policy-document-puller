@@ -66,6 +66,9 @@ class StateFarmAdapter:
     # earlier channel/no_viewport overrides changed SF's responsive layout and
     # broke the step-up clicks.
     launch = LaunchSpec(headless=False, egress=Egress.MOBILE_PROXY)
+    # Use a persistent browser profile so a trusted device's session + Okta DT
+    # cookie survive across runs and skip MFA (opt-in; delete the dir to reset).
+    device_trust = True
 
     async def prewarm(self, page: Page) -> None:
         """Optional speedup: navigate to the login page (the slow part — loading
@@ -122,31 +125,44 @@ class StateFarmAdapter:
                                "— see /tmp/sf_login_fail.png")
 
         await _check_remember(page)               # opt into device trust (skip MFA next login)
-        await _submit(page)
-        # Prototype pattern: detect the choose-method screen by its body text and
-        # fire the pick EXACTLY ONCE (set the flag before calling, so a re-click
-        # never toggles the radio back off). OTP screen reached = otp box present
-        # or we're on /login-ui/vc. If we land on my.statefarm.com first, the
-        # device was trusted and Okta skipped MFA entirely.
-        picked = False
-        for _ in range(80):                       # ~20s through step-up -> OTP (finer 250ms poll)
-            await page.wait_for_timeout(250)
-            await _dismiss_passkey(page)
-            if page.url.startswith("https://my.statefarm.com"):    # trusted device -> MFA skipped
-                return MfaPrompt(required=False)
-            if await _otp_present(page) or "login-ui/vc" in page.url.lower():
-                return MfaPrompt(required=True,
-                                 message="Enter the code State Farm texted you.")
-            try:
-                body = (await page.inner_text("body")).lower()
-            except Exception:
-                body = ""
-            if not picked and any(k in body for k in (
-                    "how do you want", "where should we", "send a code",
-                    "send you a code", "receive a code", "get a code",
-                    "text message", "verification method", "choose how")):
-                picked = True                     # attempt exactly once
-                await _pick_code_method(page)
+        # Watch the OAuth token exchange during login. On the trusted/skip-MFA
+        # path submit_mfa never runs, so capture the token here to keep
+        # list_documents on the fast pure-API path (else it falls back to the
+        # slow Document Center SPA).
+        token_responses: list = []
+
+        def _grab_token(resp):
+            if "/v1/token" in resp.url.lower() and resp.request.method == "POST":
+                token_responses.append(resp)
+
+        page.on("response", _grab_token)
+        try:
+            await _submit(page)
+            # Pick the code method EXACTLY ONCE. OTP reached = otp box /
+            # login-ui/vc. Landing on my.statefarm.com first = trusted device,
+            # MFA skipped.
+            picked = False
+            for _ in range(80):                   # ~20s through step-up -> OTP (finer 250ms poll)
+                await page.wait_for_timeout(250)
+                await _dismiss_passkey(page)
+                if page.url.startswith("https://my.statefarm.com"):    # trusted -> MFA skipped
+                    await _store_token(token_responses, page.context)
+                    return MfaPrompt(required=False)
+                if await _otp_present(page) or "login-ui/vc" in page.url.lower():
+                    return MfaPrompt(required=True,
+                                     message="Enter the code State Farm texted you.")
+                try:
+                    body = (await page.inner_text("body")).lower()
+                except Exception:
+                    body = ""
+                if not picked and any(k in body for k in (
+                        "how do you want", "where should we", "send a code",
+                        "send you a code", "receive a code", "get a code",
+                        "text message", "verification method", "choose how")):
+                    picked = True                 # attempt exactly once
+                    await _pick_code_method(page)
+        finally:
+            page.remove_listener("response", _grab_token)
         try:
             await page.screenshot(path="/tmp/sf_stepup_fail.png", full_page=True)
         except Exception:
@@ -356,6 +372,20 @@ async def _check_remember(page: Page) -> None:
         except Exception:
             continue
     print("  [sf] could NOT enable remember-me", flush=True)
+
+
+async def _store_token(responses, context) -> None:
+    """Pull access_token from a captured /v1/token response and stash it as the
+    Bearer for this context, so the doc APIs run pure-API (no SPA fallback)."""
+    for resp in responses:
+        try:
+            tok = (await resp.json()).get("access_token")
+            if tok:
+                _ctx_auth[id(context)] = f"Bearer {tok}"
+                print("  [sf] captured OAuth token on trusted landing", flush=True)
+                return
+        except Exception:
+            continue
 
 
 async def _fill(page: Page, selectors, value: str, label: str) -> bool:

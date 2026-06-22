@@ -6,7 +6,6 @@ wait by the SessionStore. Credentials are used in-memory and never logged; PDFs
 are streamed to the client and never written to disk.
 """
 import asyncio
-import hashlib
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,14 +24,13 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 store = SessionStore()
 
 
-def _state_dir(carrier: str, username: str) -> str:
-    """Per (carrier, username) persistent browser-profile dir for opt-in device
-    trust. The whole profile persists here, so Okta's device trust survives.
-    Username is hashed so it never lands in a path."""
+def _state_dir(carrier: str) -> str:
+    """Per-carrier persistent browser-profile dir for opt-in device trust. Keyed
+    by carrier (one account per carrier) so it can be loaded at carrier-select
+    without the username — fine for the demo; production would scope per user."""
     d = Path(config.STATE_DIR)
     d.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256(f"{carrier}:{username}".encode()).hexdigest()[:16]
-    return str(d / h)
+    return str(d / carrier)
 
 
 @asynccontextmanager
@@ -88,8 +86,13 @@ async def prewarm(req: PrewarmReq):
     if adapter is None or not hasattr(adapter, "prewarm"):
         return {"session_id": None}
     try:
-        br = await launch(adapter.launch)
+        # Device-trust carriers (State Farm) always warm a PERSISTENT profile, so
+        # any saved session / device-trust cookie loads up front and login reuses
+        # this same window — no second launch. (Delete the dir to reset / log out.)
+        state_dir = _state_dir(req.carrier) if getattr(adapter, "device_trust", False) else None
+        br = await launch(adapter.launch, user_data_dir=state_dir)
         sess = store.create(req.carrier, adapter, br)
+        sess.state_path = state_dir
         await adapter.prewarm(br.page)
     except Exception:
         return {"session_id": None}
@@ -101,16 +104,24 @@ async def login(req: LoginReq):
     adapter = get_adapter(req.carrier)
     if adapter is None:
         raise HTTPException(400, f"unknown carrier '{req.carrier}'")
-    state_dir = _state_dir(req.carrier, req.username) if req.remember else None
+    sd = _state_dir(req.carrier)
+    use_persistent = getattr(adapter, "device_trust", False)
     sess = None
-    # Remember-flow: launch a persistent profile so device trust persists across
-    # runs (first login writes it; later ones reuse it → Okta skips MFA). The
-    # prewarmed context is ephemeral, so we can't reuse it here.
-    if state_dir:
+    if use_persistent:
+        # Reuse the prewarmed persistent profile (warmed at carrier-select when the
+        # device is already trusted) — no launch at click. Else launch it now;
+        # first opt-in writes the profile, later logins reuse it → Okta skips MFA.
         if req.session_id:
-            await store.close(req.session_id)   # discard the ephemeral prewarmed context
-        br = await launch(adapter.launch, user_data_dir=state_dir)
-        sess = store.create(req.carrier, adapter, br)
+            warm = store.get(req.session_id)
+            if (warm is not None and warm.carrier == req.carrier
+                    and warm.state_path == sd and not warm.authenticated):
+                sess = warm
+            else:
+                await store.close(req.session_id)
+        if sess is None:
+            br = await launch(adapter.launch, user_data_dir=sd)
+            sess = store.create(req.carrier, adapter, br)
+        sess.state_path = sd
     else:
         # Reuse a prewarmed session if handed in and still valid; else launch fresh.
         if req.session_id:
@@ -121,7 +132,6 @@ async def login(req: LoginReq):
             br = await launch(adapter.launch)
             sess = store.create(req.carrier, adapter, br)
     sess.remember = req.remember
-    sess.state_path = state_dir
     try:
         mfa = await adapter.start_login(
             sess.browser.page, Credentials(username=req.username, password=req.password))
