@@ -118,7 +118,7 @@ never hardcoded (they're session-scoped and would break).
 `SessionStore` keeps each user's authenticated session warm between `login → MFA →
 fetch`, so it survives the human MFA wait and repeated fetches. Sessions are reaped
 after a TTL of inactivity (`SESSION_TTL`, default 600s) and on shutdown. Nothing is
-persisted; PDFs stream straight to the client.
+persisted; PDFs are returned directly in the response, never written to disk.
 
 For State Farm, a **prewarm** step runs the slow browser token-mint in the
 background the moment you pick the carrier and type your username — so the "log in"
@@ -135,7 +135,7 @@ local and fast; State Farm's browser runs under Xvfb inside the container.
 - Credentials are typed into the UI, used in memory, and **never** written to disk,
   logged, or persisted. The MFA code is the user's, supplied at runtime.
 - Each session is ephemeral — no profile reuse, no stored cookies.
-- PDFs stream to the client, never saved server-side.
+- PDFs are returned directly in the response, never saved server-side.
 - The only on-disk secret is the proxy credential in `.env` (gitignored).
 - The demo binds publicly for convenience; production would put it behind
   auth/TLS and lock the port down.
