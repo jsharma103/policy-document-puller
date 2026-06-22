@@ -2,120 +2,118 @@
 
 URL: http://167.172.137.214:8000 · Order: **State Farm → Lemonade → Goodcover**
 
-Each section is **[DO]** = what to click, **[SAY]** = narration. Keep the demo
-running while you talk over it.
+**[DO]** = what to click, **[SAY]** = narration. Keep the demo running while you talk.
 
 ---
 
-## 0:00 — Intro (~15s)
+## 0:00 — Intro + the core idea (~25s)
 
 **[SAY]**
-> This is a hosted FastAPI + Playwright app that logs into three insurance
-> carriers — handling password and MFA — and pulls the policy document back,
-> with a hard budget of **8 seconds from MFA submit to the PDF on screen**.
-> One constraint up front: **no credentials are ever stored** — they're typed
-> in live and used in-memory, nothing persisted, nothing logged.
+> This is a hosted app that logs into three insurance carriers — handling
+> password and MFA — and pulls the policy document back, with a hard budget of
+> **8 seconds from MFA submit to the PDF on screen**. Credentials are never
+> stored — typed in live, used in-memory, nothing persisted or logged.
 
-> I'll start with the hardest carrier, State Farm, because it drove the whole
-> architecture.
+> The core design decision: instead of driving a browser and clicking through
+> their UI, I wanted to **talk to each carrier's backend APIs directly** — both
+> for login and for fetching the documents. That's the fast, clean path. The
+> work was **reverse-engineering how their authentication and document APIs
+> actually work** — and that's most of what I want to walk through.
 
 ---
 
-## 0:15 — State Farm: the architecture (~70s)
+## 0:25 — State Farm: the hard one (~75s)
 
 **[DO]** Select **State Farm**. Type the username, tab out, type the password.
-(Narrate while the prewarm runs invisibly.)
 
-**[SAY] — the problem**
-> State Farm is the hard one: real bot detection, **AWS WAF Bot Control** on the
-> login POST, and a multi-domain **Okta Identity Engine** flow. A naïve headful
-> browser login was about **17 seconds** just to the MFA prompt — way over budget.
+**[SAY] — what I reverse-engineered**
+> State Farm was the deepest. Login isn't a simple form post — it's a multi-step
+> **Okta Identity Engine** flow across a couple of domains. I traced the whole
+> thing and rebuilt it as **direct HTTP calls** using `curl_cffi`, which
+> impersonates Chrome's TLS fingerprint: bootstrap the flow, submit the password,
+> request the email OTP, exchange the code for an access token. Then the
+> **Document Center APIs** — I reverse-engineered those too: they're Bearer-
+> authed, so once I have the token I pull the policy binder straight from the API.
 
-**[SAY] — the hybrid (the key idea)**
-> So I reverse-engineered it into a **hybrid**. The WAF only gates one thing — a
-> JavaScript-computed token on the password step. So a **brief headless browser
-> mints just that one token**, and then the *entire* rest of login — the whole
-> Okta flow — runs as plain HTTP using `curl_cffi`, which impersonates Chrome's
-> TLS fingerprint. No login SPA, no page renders.
+**[SAY] — the one place a browser is needed**
+> There's exactly one wrinkle. State Farm puts **AWS WAF Bot Control** on the
+> login step — it needs a token that's computed by JavaScript in a real browser.
+> So a **brief headless browser mints just that one token**, hands it to the HTTP
+> client, and everything else — the entire Okta flow and all the document calls —
+> is pure HTTP. Browser only where the bot defense literally forces it.
 
-**[SAY] — prewarm (why the click is fast)**
-> And the slow browser part is moved **off the clock**. The moment I pick the
-> carrier, it mints the token and runs the steps that don't need credentials.
-> When I leave the username field, it runs the username-only steps. So by the
-> time I actually click **Log in**, all that's left is password plus the OTP
-> request — fast HTTP.
+**[SAY] — prewarm (why the click is instant)**
+> And that token mint plus the credential-free setup steps run the moment I pick
+> the carrier and leave the username field — **before I ever click Log in**. So
+> the actual login click only pays for password plus the OTP request.
 
-**[DO]** Click **Log in** → MFA prompt appears (~1.8s). Point at the latency line.
+**[DO]** Click **Log in** → MFA prompt (~1.8s). Point at the latency line.
 
 **[SAY]**
 > Login to MFA prompt — under two seconds.
 
-**[DO]** Grab the OTP, enter it, **Submit code** → PDF renders. Point at latency.
+**[DO]** Enter the OTP, **Submit code** → PDF renders. Point at latency.
 
 **[SAY]**
-> MFA submit to document — about three seconds, comfortably under the eight-second
-> budget. And the document fetch is a direct Bearer-authed API call, no proxy.
+> MFA submit to document — about three seconds, well under the eight-second budget,
+> pulled straight from the document API.
 
-**[SAY] — the fallback (resilience)**
-> One thing I want to call out: this is **reverse-engineered**, so it's fragile by
-> nature — if State Farm changes the WAF or the Okta flow, the API path breaks.
-> So there's an **automatic fallback**: if any API step fails, login transparently
-> drops back to the original full Playwright browser flow. Slower, but it still
-> works. Fast path by default, proven path as a safety net.
+**[SAY] — fallback**
+> Since this is reverse-engineered, it's inherently fragile — if they change the
+> auth flow it breaks. So there's an **automatic fallback**: if any API step
+> fails, login transparently drops to a full browser flow that drives the real
+> UI. Direct-API fast path by default, browser as the safety net.
 
 ---
 
-## 1:25 — Lemonade: fully browser-free (~35s)
+## 1:40 — Lemonade: no browser at all (~30s)
 
-**[DO]** Switch to **Lemonade**. Note the password field disappears (email + OTP only).
-
-**[SAY]**
-> Lemonade I took all the way — **no browser at all**. I reverse-engineered the
-> whole login as HTTP: scrape the CSRF token, trigger the email OTP, sign in,
-> follow the OAuth redirect chain, hit the policies API, and pull the PDF — all
-> `curl_cffi` impersonating Chrome, which clears their Cloudflare check at the
-> network layer.
-
-**[DO]** Enter email → **Log in** → OTP → document. Point at latency (~3s end-to-end).
+**[DO]** Switch to **Lemonade** — password field disappears (email + OTP only).
 
 **[SAY]**
-> No Chromium launched at all — login to document in about three seconds, and far
-> lighter on the host. Same browser fallback here too, for robustness.
+> Lemonade I took all the way to **zero browser**. I reverse-engineered the full
+> login as HTTP — grab the CSRF token, trigger the email OTP, sign in, follow the
+> OAuth redirect chain, hit the policies API, and pull the PDF — all `curl_cffi`
+> impersonating Chrome, which clears their bot check at the network layer.
+
+**[DO]** Enter email → **Log in** → OTP → document. Point at latency (~3s).
+
+**[SAY]**
+> No browser launched at all — login to document in about three seconds. Same
+> browser fallback here if the API path ever fails.
 
 ---
 
-## 2:00 — Goodcover: browser by choice (~25s)
+## 2:10 — Goodcover: browser by choice (~25s)
 
 **[DO]** Switch to **Goodcover**. Log in (no MFA) → document.
 
 **[SAY]**
-> Goodcover is the interesting counter-example. It's the *simplest* carrier —
-> email, password, no MFA — but I deliberately **kept it on the browser**. Its
-> login is protobuf-encoded, persisted-GraphQL behind Cloudflare: brittle to
-> hand-roll and tightly coupled to their frontend build. It's already fast with
-> no MFA, so the right engineering call was *not* to reimplement it. The
-> optimization here was the judgment call.
+> Goodcover is the counter-example. It's the simplest carrier — email, password,
+> no MFA — but I deliberately **kept it on the browser**. Its login is
+> protobuf-encoded, persisted-GraphQL behind Cloudflare: brittle to hand-roll and
+> tightly coupled to their frontend build. It's already fast with no MFA, so the
+> right call was *not* to reverse-engineer it. Knowing when not to was part of
+> the work.
 
 ---
 
-## 2:25 — Close (~20s)
+## 2:35 — Close (~15s)
 
 **[SAY]**
-> So the guiding principle across all three: **use a real browser only where the
-> carrier's bot defenses force it, run everything else as plain HTTP, and pre-warm
-> the browser-dependent work off the critical path.** All three land well under
-> the eight-second budget, it's deployed and hosted, and credentials are never
-> persisted. Thanks for watching.
+> So across all three: **hit the backend APIs directly wherever I could
+> reverse-engineer them, and only fall back to a browser where bot defenses force
+> it.** All three land well under the eight-second budget, it's deployed and
+> hosted, and credentials are never persisted. Thanks for watching.
 
 ---
 
 ### Cheat sheet (numbers to point at)
 | Carrier | Login → MFA | MFA → document | Approach |
 |---|---|---|---|
-| State Farm | ~1.8s | ~3.0s | Hybrid: browser mints WAF token → HTTP Okta + direct docs |
-| Lemonade | — (email+OTP) | ~3s total | Pure-API (`curl_cffi`) |
-| Goodcover | — (no MFA) | fast | Browser (deliberate) |
+| State Farm | ~1.8s | ~3.0s | Direct-API auth + docs; browser mints only the WAF token |
+| Lemonade | — (email+OTP) | ~3s total | Fully direct-API (`curl_cffi`), no browser |
+| Goodcover | — (no MFA) | fast | Browser (deliberate — too brittle to reverse) |
 
-**If something flakes mid-record:** State Farm may fall back to the browser
-(slower, ~10s) — that's the fallback *working*; either call it out as a feature
-or just re-record that carrier.
+**If State Farm flakes mid-record:** it may fall back to the browser (slower) —
+that's the fallback *working*; call it out as a feature or re-record that carrier.
