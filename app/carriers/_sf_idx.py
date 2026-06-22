@@ -38,7 +38,13 @@ async def mint_waf_token(proxy: dict | None) -> str | None:
     AWS WAF JS challenge run, and return the `aws-waf-token` cookie value."""
     from patchright.async_api import async_playwright
     pw = await async_playwright().start()
-    kw: dict = {"headless": False, "args": ["--disable-blink-features=AutomationControlled"]}
+    # awswaf detects headless (no token), so the mint is HEADFUL — but positioned
+    # far off-screen so there's no visible flash locally; on the server it runs
+    # under Xvfb (virtual display), so there's no window either way.
+    kw: dict = {"headless": False, "args": [
+        "--disable-blink-features=AutomationControlled",
+        "--window-position=-4000,-4000", "--window-size=500,400",
+    ]}
     if proxy:
         kw["proxy"] = proxy
     browser = await pw.chromium.launch(**kw)
