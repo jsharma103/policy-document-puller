@@ -1,72 +1,84 @@
 # Latency optimizations
 
 Guiding principle: **use a real browser only where the carrier's bot defenses
-force it, and run everything else as plain HTTP — pre-warming every
-browser-dependent step off the critical path.** All numbers below are measured on
-the hosted VM (DigitalOcean droplet, mobile-proxy egress where required).
+force it, run everything else as plain HTTP, and pre-warm any browser-dependent
+step off the critical path.** Numbers are measured on the hosted DigitalOcean VM
+(4 GB, mobile-proxy egress where required).
 
-The two metrics:
+Two metrics:
 - **Login → MFA prompt** — clicking Log in until the code prompt appears.
 - **MFA submit → document** — submitting the code until the PDF renders (the 8s budget).
 
----
-
-## State Farm — the hard carrier (11.5s → ~4.8s combined)
-
-Real bot detection + **AWS WAF Bot Control** on the credential step + a
-multi-domain **Okta Identity Engine (IDX)** flow. It began as a full headful
-browser login (~17s just to the MFA prompt). It was rebuilt into a hybrid —
-a brief stealth browser mints *only* the one token the WAF requires, and the
-entire Okta IDX flow + document fetch then run as `curl_cffi` HTTP — and four
-optimizations were stacked on top:
-
-| # | Optimization | What changed | Impact |
-|---|---|---|---|
-| 1 | **Hybrid: browser-minted `aws-waf-token` → `curl_cffi` Okta IDX** | Reverse-engineered the IDX API. The WAF gates only the password POST behind a JS-computed token, so a brief browser mints just that token; the rest of login is fast HTTP, not the login SPA. | Replaced the ~17s SPA login; integrated baseline **11.5s** combined |
-| 2 | **Direct (no-proxy) document fetch** | The Document Center APIs are Bearer-authed and IP-agnostic, so they don't need the mobile proxy — fetched straight from the VM. | MFA→doc **6.22s → 3.43s** |
-| 3 | **Prewarm `interact` / `introspect`** | These IDX bootstrap calls need no username, so they run at carrier-select (overlapping typing) instead of at login. | Login→MFA **4.90s → 2.91s** |
-| 4 | **2-stage prewarm: `identify` on username-blur** | `identify` + select-password need only the username, so they fire when the username field loses focus (overlapping password typing). Login then performs only password + OTP request. | Login→MFA **2.91s → 1.89s** |
-
-Supporting changes:
-- **WAF token minted during prewarm**, in an off-screen window locally / under
-  Xvfb on the server — so it's windowless and entirely off the measured login path.
-- **`customerMetadata?year=<current>`** instead of `year=0` — surfaces the policy
-  **binder** (the `year=0` "Currently Active" view returns only billing docs).
-- **Automatic browser fallback** — if any API step fails (WAF change, expired
-  interaction), login transparently drops to the original full Playwright flow.
-
-**Result:** Login→MFA **~1.8s** + MFA→doc **~3.0s** = **~4.8s combined**, windowless,
-pure-HTTP after the hidden mint.
+Each carrier below: **current** architecture and latency first, then what was
+tried before it, newest to oldest, with the latency at each stage.
 
 ---
 
-## Lemonade — fully browser-free (~3s login → document)
+## State Farm
 
-The easy carrier; previously a headless browser flow. One optimization:
+### Current — hybrid, ~4.8s combined (~5–8s typical with proxy variance)
 
-- **Pure-API (no browser at all).** Reverse-engineered the login:
-  `GET /login` (scrape CSRF) → `presign` (sends the OTP) → `signin` → follow the
-  OAuth redirect chain → dashboard `policies` API → fetch the policy `form_url`
-  PDF — all over `curl_cffi` impersonating Chrome (which clears Lemonade's
-  Cloudflare check at the network layer). **No Chromium launched.**
-  - **Impact:** removes the headless-browser launch + SPA render entirely →
-    login → document in **~3s**, and far lighter on a 2-vCPU host.
-- **Playwright fallback** (robustness, not speed): if the API path fails, it
-  drops to the proven browser flow.
+A brief stealth browser mints **only** the one JS-computed `aws-waf-token` the AWS
+WAF requires; the entire Okta Identity Engine (IDX) login and the Document Center
+fetch then run as `curl_cffi` HTTP. Login egresses through a mobile proxy (State
+Farm rejects datacenter IPs); the Bearer-authed document APIs are IP-agnostic, so
+they're fetched direct from the VM. The token-mint plus the credential-free login
+steps are pre-warmed off the click, and there's an automatic fallback to the full
+browser flow if any API step fails.
+
+- **Login → MFA prompt: ~1.8s** · **MFA submit → document: ~3.0s**
+
+### How we got here (newest → oldest)
+
+- **Before 2-stage prewarm (`identify` on username-blur):** the Log in click still
+  ran the username-only IDX steps. → Login → MFA **2.91s**.
+- **Before pre-warming `interact` / `introspect`:** the IDX bootstrap ran at login
+  instead of at carrier-select. → Login → MFA **4.90s**.
+- **Before direct document fetch:** documents were pulled through the mobile proxy,
+  like login. → MFA → document **6.22s** (first working hybrid, ~11.5s combined).
+- **Before the hybrid (original):** a full headful Playwright login driving the
+  real SPA. → **~17s just to the MFA prompt** — well over budget, and the reason
+  for the rewrite.
 
 ---
 
-## Goodcover — kept the browser (a deliberate call)
+## Lemonade
 
-The simplest carrier (email/password, no MFA). Pure-API was evaluated and
-rejected: its login is **protobuf-encoded, persisted-GraphQL behind Cloudflare** —
-brittle to hand-roll and tightly coupled to their frontend build.
+### Current — pure-API, ~3–4s login → document
 
-- **Decision: stay on the browser.** It's already fast (no MFA; near-instant
-  login → dashboard), and the PDF is the "Download Policy" link's `href`, fetched
-  directly through the authenticated context.
-- The optimization here was the **judgment call** — confirming a browser is the
-  right tool rather than maintaining a fragile reimplementation for no real gain.
+No browser at all. The whole flow is reverse-engineered HTTP over `curl_cffi`
+(impersonating Chrome, which clears Lemonade's Cloudflare check at the network
+layer): `GET /login` (scrape CSRF) → `presign` (sends the OTP) → `signin` → follow
+the OAuth redirect chain → `policies` API → fetch the policy `form_url` PDF. A
+Playwright fallback covers an API failure (robustness, not speed).
+
+- **Login → document: ~3–4s**
+
+### How we got here (newest → oldest)
+
+- **Before pure-API:** a headless Playwright browser flow — launch Chromium, render
+  the login SPA, drive it, read the dashboard. → **~5.7s**, and far heavier on the
+  2-vCPU host. Removing the browser launch + SPA render is the entire win.
+
+---
+
+## Goodcover
+
+### Current — browser, ~5–6s (no MFA)
+
+The simplest carrier (email/password, no MFA), kept on a headless browser on a
+direct datacenter IP. The PDF is the "Download Policy" link's `href`, fetched
+through the authenticated context.
+
+- **Login → document: ~5–6s**
+
+### What was tried before (newest → oldest)
+
+- **Pure-API — evaluated and rejected.** Its login is protobuf-encoded,
+  persisted-GraphQL behind Cloudflare: brittle to hand-roll and tightly coupled to
+  their frontend build. It was never built — the optimization here was the
+  **judgment call** to not reimplement a fragile path for no real gain on an
+  already-fast, MFA-free carrier.
 
 ---
 
@@ -75,10 +87,10 @@ brittle to hand-roll and tightly coupled to their frontend build.
 | Carrier | Approach | Login → MFA | MFA → document |
 |---|---|---|---|
 | State Farm | Hybrid (browser mints WAF token → HTTP IDX + direct docs) | ~1.8s | ~3.0s |
-| Lemonade | Pure-API (`curl_cffi`), browser fallback | — (email + OTP) | ~3s end-to-end |
-| Goodcover | Browser (no MFA) | — | fast (no MFA) |
+| Lemonade | Pure-API (`curl_cffi`), browser fallback | — (email + OTP) | ~3–4s end-to-end |
+| Goodcover | Browser (no MFA) | — | ~5–6s end-to-end |
 
-The same prewarm pattern underlies all of them: the moment a carrier is selected
-(and, for State Farm, the moment the username is entered), the slow,
+The same prewarm pattern underlies the fast carriers: the moment a carrier is
+selected (and, for State Farm, the moment the username is entered), the slow,
 browser-dependent work runs in the background so the user-facing clicks pay only
 for fast HTTP.
