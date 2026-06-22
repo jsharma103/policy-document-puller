@@ -5,7 +5,7 @@ from .lemonade import LemonadeAdapter
 from .statefarm import StateFarmAdapter
 
 _ADAPTERS: dict[str, CarrierAdapter] = {
-    a.name: a for a in (LemonadeAdapter(), StateFarmAdapter(), GoodcoverAdapter())
+    a.name: a for a in (LemonadeAdapter(), GoodcoverAdapter(), StateFarmAdapter())
 }
 
 
