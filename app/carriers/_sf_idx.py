@@ -129,9 +129,14 @@ def _messages(j) -> list:
     return [m.get("message") for m in (j.get("messages") or {}).get("value", [])]
 
 
-async def start(http, data: dict, username: str, password: str) -> None:
-    """interact → introspect → identify → password → request the email OTP.
-    Stashes `code_verifier` + `stateHandle` in `data`. Raises on reject/WAF block."""
+class StaleStateError(Exception):
+    """The prewarmed IDX interaction expired before login — caller re-runs preauth."""
+
+
+async def preauth(http, data: dict) -> None:
+    """interact → introspect: the IDX steps that need NO username/password. Run at
+    prewarm (carrier-select) so they overlap credential typing. Stashes the PKCE
+    `code_verifier` + the `stateHandle` so `resume` can pick up from here."""
     verifier = _b64u(secrets.token_bytes(32))
     challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
     data["code_verifier"] = verifier
@@ -142,8 +147,23 @@ async def start(http, data: dict, username: str, password: str) -> None:
                       form=True)).json()["interaction_handle"]
     sh = (await _post(http, "/api/idp/idx/introspect",
                       {"interactionHandle": ih}, ion=True)).json()["stateHandle"]
-    j = (await _post(http, "/api/idp/idx/identify",
-                     {"identifier": username, "stateHandle": sh})).json()
+    data["stateHandle"] = sh
+    data["preauth_done"] = True
+
+
+async def resume(http, data: dict, username: str, password: str) -> None:
+    """identify → password → request the email OTP, resuming the prewarmed
+    interaction. Raises StaleStateError if that interaction expired (caller
+    re-preauths), RuntimeError on a real credential rejection / WAF block."""
+    sh = data.get("stateHandle")
+    if not sh:
+        raise StaleStateError("no preauth state")
+    r = await _post(http, "/api/idp/idx/identify", {"identifier": username, "stateHandle": sh})
+    if "json" not in r.headers.get("content-type", ""):
+        raise StaleStateError("identify lost the IDX session")
+    j = r.json()
+    if not j.get("stateHandle"):
+        raise StaleStateError(f"identify failed (likely expired): {_messages(j)}")
     sh = j["stateHandle"]
     pw_id = _find_password_id(j) or _PW_AUTH_FALLBACK
     sh = (await _post(http, "/api/idp/idx/challenge",
@@ -170,6 +190,12 @@ async def start(http, data: dict, username: str, password: str) -> None:
     sh = (await _post(http, "/api/idp/idx/challenge",
                       {"authenticator": auth, "stateHandle": sh})).json()["stateHandle"]
     data["stateHandle"] = sh
+
+
+async def start(http, data: dict, username: str, password: str) -> None:
+    """Full flow (used when not prewarmed): preauth then resume."""
+    await preauth(http, data)
+    await resume(http, data, username, password)
 
 
 async def finish(http, data: dict, code: str) -> str:

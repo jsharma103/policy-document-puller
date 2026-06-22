@@ -74,9 +74,10 @@ class StateFarmAdapter:
     async def prewarm(self, page) -> None:
         if isinstance(page, ApiSession):
             try:
-                await self._ensure_waf_token(page)   # mint now so the ~2-3s overlaps cred typing
+                await self._ensure_waf_token(page)            # mint the WAF token
+                await _sf_idx.preauth(page.http, page.data)   # + interact/introspect, overlapping typing
             except Exception:
-                pass                                 # best-effort; start_login mints if needed
+                pass                                          # best-effort; start_login redoes it
             return
         await self._browser_prewarm(page)
 
@@ -116,7 +117,14 @@ class StateFarmAdapter:
 
     async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
         await self._ensure_waf_token(api)            # no-op if prewarm already minted it
-        await _sf_idx.start(api.http, api.data, creds.username, creds.password or "")
+        pw = creds.password or ""
+        try:
+            if not api.data.get("preauth_done"):     # prewarm usually did interact/introspect
+                await _sf_idx.preauth(api.http, api.data)
+            await _sf_idx.resume(api.http, api.data, creds.username, pw)   # identify → password → OTP
+        except _sf_idx.StaleStateError:              # prewarmed interaction expired — redo fresh, retry once
+            await _sf_idx.preauth(api.http, api.data)
+            await _sf_idx.resume(api.http, api.data, creds.username, pw)
         print("  [sf] API login: password accepted, email OTP requested", flush=True)
         return MfaPrompt(required=True, message="Enter the code State Farm emailed you.")
 
