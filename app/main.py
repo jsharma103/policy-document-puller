@@ -8,6 +8,7 @@ are streamed to the client and never written to disk.
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -98,13 +99,31 @@ async def login(req: LoginReq):
     if sess is None:
         br = await launch(adapter.launch)
         sess = store.create(req.carrier, adapter, br)
+    creds = Credentials(username=req.username, password=req.password)
     try:
-        mfa = await adapter.start_login(
-            sess.browser.page, Credentials(username=req.username, password=req.password))
+        mfa = await adapter.start_login(sess.browser.page, creds)
     except Exception as e:
-        print(f"  [login err] {req.carrier}: {type(e).__name__}: {e}", flush=True)
-        await store.close(sess.id)
-        raise HTTPException(502, f"login failed: {e}")
+        # API-transport carriers fall back to the browser flow on a login failure
+        # (e.g. the carrier starts Cloudflare-challenging the HTTP client). Relaunch
+        # with a real browser and retry the proven Playwright path; everything after
+        # this routes to the browser automatically (the adapter dispatches on type).
+        if getattr(adapter.launch, "transport", "browser") == "api":
+            print(f"  [login] {req.carrier}: API path failed ({type(e).__name__}: {e}); "
+                  "falling back to browser", flush=True)
+            await store.close(sess.id)
+            br = await launch(replace(adapter.launch, transport="browser"))
+            sess = store.create(req.carrier, adapter, br)
+            try:
+                mfa = await adapter.start_login(sess.browser.page, creds)
+            except Exception as e2:
+                print(f"  [login err] {req.carrier} (browser fallback): "
+                      f"{type(e2).__name__}: {e2}", flush=True)
+                await store.close(sess.id)
+                raise HTTPException(502, f"login failed: {e2}")
+        else:
+            print(f"  [login err] {req.carrier}: {type(e).__name__}: {e}", flush=True)
+            await store.close(sess.id)
+            raise HTTPException(502, f"login failed: {e}")
     return {"session_id": sess.id,
             "mfa": {"required": mfa.required, "message": mfa.message}}
 
