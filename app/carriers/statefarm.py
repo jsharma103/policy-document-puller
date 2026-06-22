@@ -17,6 +17,7 @@ Each lifecycle method dispatches on the transport it's handed (ApiSession vs a
 Playwright page/context).
 """
 import re
+from datetime import datetime
 
 from playwright.async_api import BrowserContext, Page
 
@@ -153,7 +154,7 @@ class StateFarmAdapter:
         if not auth:
             raise RuntimeError("no OAuth token for this session")
         http = self._doc_session(api)
-        r = await http.get(f"{_DC_PROXY}/customerMetadata?year=0",
+        r = await http.get(f"{_DC_PROXY}/customerMetadata?year={datetime.now().year}",
                            headers={"authorization": auth}, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(f"customerMetadata -> {r.status_code}")
@@ -306,7 +307,7 @@ class StateFarmAdapter:
         auth = _ctx_auth.get(id(context))
         if not auth:
             raise RuntimeError("no OAuth token captured")
-        r = await context.request.get(f"{_DC_PROXY}/customerMetadata?year=0",
+        r = await context.request.get(f"{_DC_PROXY}/customerMetadata?year={datetime.now().year}",
                                       headers={"authorization": auth})
         if not r.ok:
             raise RuntimeError(f"customerMetadata -> {r.status}")
