@@ -34,6 +34,7 @@ class LaunchSpec:
     each tolerates different things (see carrier-flow findings)."""
     headless: bool = True             # State Farm must be headful (run under Xvfb on the server)
     egress: Egress = Egress.DIRECT    # State Farm: MOBILE_PROXY
+    transport: str = "browser"        # "browser" (Playwright) or "api" (curl_cffi, no browser)
 
 
 @dataclass

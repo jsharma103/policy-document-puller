@@ -7,12 +7,16 @@ LaunchSpec; proxy secrets are resolved from the environment here so adapters
 never touch them.
 """
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Browser as PWBrowser
 from playwright.async_api import BrowserContext, Page
 
 from . import config
 from .carriers.base import Egress, LaunchSpec
+
+if TYPE_CHECKING:
+    from .carriers._api import ApiSession
 
 _WEBDRIVER_MASK = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
 _pw = None  # patchright Playwright, started once and reused across sessions
@@ -28,18 +32,29 @@ async def _patchright():
 
 @dataclass
 class Browser:
-    pw_browser: PWBrowser
-    context: BrowserContext
-    page: Page
+    # For the "api" transport there's no Playwright browser: pw_browser is None and
+    # context/page both hold the ApiSession (curl_cffi). Closing it closes the HTTP
+    # session; the rest of the app treats it exactly like a browser-backed session.
+    pw_browser: "PWBrowser | None"
+    context: "BrowserContext | ApiSession"
+    page: "Page | ApiSession"
 
     async def aclose(self) -> None:
         try:
             await self.context.close()
         finally:
-            await self.pw_browser.close()
+            if self.pw_browser is not None:
+                await self.pw_browser.close()
 
 
 async def launch(spec: LaunchSpec) -> Browser:
+    if spec.transport == "api":
+        # Browser-free carrier (Lemonade): a curl_cffi session stands in for the
+        # page/context everywhere downstream — no Chromium launched.
+        from .carriers._api import ApiSession
+        api = ApiSession()
+        return Browser(pw_browser=None, context=api, page=api)
+
     pw = await _patchright()
     headless = spec.headless
     if config.HEADLESS_OVERRIDE in ("0", "1"):
