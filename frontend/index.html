@@ -120,23 +120,28 @@ function syncPwField() {
 // backend only warms carriers that implement prewarm; best-effort either way —
 // if it doesn't warm, login just launches fresh. Biggest win on State Farm
 // (headful + proxy); marginal on Lemonade (already fast).
-// Warm on carrier pick. If this carrier already has a trusted profile, the
-// backend warms THAT persistent profile right here, so login reuses it → skip
-// MFA in a single window (no launch at click).
-$('carrier').onchange = async () => {
+// Warm on carrier pick. For device-trust carriers the backend warms a PERSISTENT
+// profile here, so login reuses that same browser → one window, no launch at
+// click. Track the warm as a promise so login can wait for it (a persistent
+// profile dir can't be opened twice — racing login would 500).
+let warming = Promise.resolve();
+$('carrier').onchange = () => {
   resetUI();
   syncPwField();
-  if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
-  try {
-    const r = await api('/api/prewarm', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ carrier: $('carrier').value }),
-    });
-    prewarmSid = r.session_id;
-  } catch (_) { prewarmSid = null; }
+  warming = (async () => {
+    if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
+    try {
+      const r = await api('/api/prewarm', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ carrier: $('carrier').value }),
+      });
+      prewarmSid = r.session_id;
+    } catch (_) { prewarmSid = null; }
+  })();
 };
 
 $('loginBtn').onclick = async () => {
+  await warming;                     // wait for the prewarm so login reuses it (no double-open)
   log('logging in…');
   lat.login = lat.render = null; $('latency').textContent = '';
   tLogin = performance.now(); tMfa = null;

@@ -108,16 +108,10 @@ async def login(req: LoginReq):
     use_persistent = getattr(adapter, "device_trust", False)
     sess = None
     if use_persistent:
-        # Reuse the prewarmed persistent profile (warmed at carrier-select when the
-        # device is already trusted) — no launch at click. Else launch it now;
-        # first opt-in writes the profile, later logins reuse it → Okta skips MFA.
-        if req.session_id:
-            warm = store.get(req.session_id)
-            if (warm is not None and warm.carrier == req.carrier
-                    and warm.state_path == sd and not warm.authenticated):
-                sess = warm
-            else:
-                await store.close(req.session_id)
+        # Reuse the prewarm that already holds this persistent profile — the dir
+        # can be open by only one browser, so opening it twice 500s. Find it by
+        # carrier+dir (not the raced session_id) so a fast click can't double-open.
+        sess = store.find_reusable(req.carrier, sd)
         if sess is None:
             br = await launch(adapter.launch, user_data_dir=sd)
             sess = store.create(req.carrier, adapter, br)

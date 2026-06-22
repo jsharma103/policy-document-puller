@@ -37,6 +37,21 @@ class SessionStore:
         self._sessions[sid] = s
         return s
 
+    def find_reusable(self, carrier: str, state_path: str | None) -> Session | None:
+        """A live, non-authenticated session for this carrier + persistent profile
+        dir (i.e. the prewarm already holding it). A persistent profile dir can be
+        open by only one browser, so login reuses this instead of opening it twice
+        (which fails with "profile already in use")."""
+        if state_path is None:
+            return None
+        now = time.time()
+        for s in self._sessions.values():
+            if (s.carrier == carrier and s.state_path == state_path
+                    and not s.authenticated and now - s.last_used <= config.SESSION_TTL):
+                s.last_used = now
+                return s
+        return None
+
     def get(self, sid: str) -> Session | None:
         s = self._sessions.get(sid)
         if s is None or time.time() - s.last_used > config.SESSION_TTL:
