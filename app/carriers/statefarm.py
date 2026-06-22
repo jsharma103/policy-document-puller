@@ -116,16 +116,43 @@ class StateFarmAdapter:
         api.data["aws_waf_token"] = token        # reused by the direct doc-fetch session
         api.data["waf_minted"] = True
 
-    async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
-        await self._ensure_waf_token(api)            # no-op if prewarm already minted it
-        pw = creds.password or ""
+    async def preidentify(self, page, username: str) -> None:
+        """Username-blur stage: identify + select-password (needs only the username)
+        so the Login click pays for just password + OTP. Best-effort — login runs the
+        full flow if this didn't complete."""
+        if not isinstance(page, ApiSession):
+            return
+        if page.data.get("identify_done") and page.data.get("identify_user") == username:
+            return
         try:
-            if not api.data.get("preauth_done"):     # prewarm usually did interact/introspect
-                await _sf_idx.preauth(api.http, api.data)
-            await _sf_idx.resume(api.http, api.data, creds.username, pw)   # identify → password → OTP
-        except _sf_idx.StaleStateError:              # prewarmed interaction expired — redo fresh, retry once
+            if not page.data.get("preauth_done"):
+                await _sf_idx.preauth(page.http, page.data)
+            await _sf_idx.identify_step(page.http, page.data, username)
+            page.data["identify_user"] = username
+        except Exception:
+            page.data["identify_done"] = False
+
+    async def _run_idx(self, api: ApiSession, username: str, password: str) -> None:
+        if not api.data.get("preauth_done"):
             await _sf_idx.preauth(api.http, api.data)
-            await _sf_idx.resume(api.http, api.data, creds.username, pw)
+        if not api.data.get("identify_done"):
+            await _sf_idx.identify_step(api.http, api.data, username)
+            api.data["identify_user"] = username
+        await _sf_idx.answer_password(api.http, api.data, username, password)
+
+    async def _api_start_login(self, api: ApiSession, creds: Credentials) -> MfaPrompt:
+        await self._ensure_waf_token(api)
+        pw = creds.password or ""
+        if api.data.get("identify_user") not in (None, creds.username):   # prewarmed a different user
+            api.data["preauth_done"] = api.data["identify_done"] = False
+        try:
+            await self._run_idx(api, creds.username, pw)
+        except _sf_idx.CredentialError as e:
+            raise RuntimeError(str(e))               # bad creds — don't retry (avoid lockout)
+        except Exception:                            # stale interaction / expired token — one fresh retry
+            api.data["preauth_done"] = api.data["identify_done"] = api.data["waf_minted"] = False
+            await self._ensure_waf_token(api)
+            await self._run_idx(api, creds.username, pw)
         print("  [sf] API login: password accepted, email OTP requested", flush=True)
         return MfaPrompt(required=True, message="Enter the code State Farm emailed you.")
 

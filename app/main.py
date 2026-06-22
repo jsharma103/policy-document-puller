@@ -58,6 +58,8 @@ class MfaReq(BaseModel):
 
 class PrewarmReq(BaseModel):
     carrier: str
+    username: str | None = None     # 2nd-stage warm-up (on username blur) reuses session_id below
+    session_id: str | None = None
 
 
 @app.get("/api/carriers")
@@ -75,6 +77,16 @@ async def prewarm(req: PrewarmReq):
     adapter = get_adapter(req.carrier)
     if adapter is None or not hasattr(adapter, "prewarm"):
         return {"session_id": None}
+    # 2nd stage (username blur): advance the existing prewarm session with the
+    # username-only login steps — don't relaunch. Best-effort.
+    if req.username and req.session_id and hasattr(adapter, "preidentify"):
+        sess = store.get(req.session_id)
+        if sess is not None and sess.carrier == req.carrier and not sess.authenticated:
+            try:
+                await adapter.preidentify(sess.browser.page, req.username)
+            except Exception:
+                pass
+            return {"session_id": sess.id}
     try:
         br = await launch(adapter.launch)
         sess = store.create(req.carrier, adapter, br)

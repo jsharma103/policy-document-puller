@@ -151,10 +151,14 @@ async def preauth(http, data: dict) -> None:
     data["preauth_done"] = True
 
 
-async def resume(http, data: dict, username: str, password: str) -> None:
-    """identify → password → request the email OTP, resuming the prewarmed
-    interaction. Raises StaleStateError if that interaction expired (caller
-    re-preauths), RuntimeError on a real credential rejection / WAF block."""
+class CredentialError(Exception):
+    """State Farm rejected the username/password — do NOT retry (avoid lockout)."""
+
+
+async def identify_step(http, data: dict, username: str) -> None:
+    """identify → select the password authenticator. Needs only the USERNAME, so
+    it runs at username-blur (overlapping password typing). Advances stateHandle to
+    'awaiting passcode'. Raises StaleStateError if the prewarmed interaction expired."""
     sh = data.get("stateHandle")
     if not sh:
         raise StaleStateError("no preauth state")
@@ -168,17 +172,30 @@ async def resume(http, data: dict, username: str, password: str) -> None:
     pw_id = _find_password_id(j) or _PW_AUTH_FALLBACK
     sh = (await _post(http, "/api/idp/idx/challenge",
                       {"authenticator": {"id": pw_id}, "stateHandle": sh})).json()["stateHandle"]
+    data["stateHandle"] = sh
+    data["identify_done"] = True
+
+
+async def answer_password(http, data: dict, username: str, password: str) -> None:
+    """answer the password → request the email OTP (needs identify_step first).
+    Raises CredentialError on a real rejection, StaleStateError if expired."""
+    sh = data.get("stateHandle")
+    if not sh:
+        raise StaleStateError("no identify state")
     r = await _post(http, "/api/idp/idx/challenge/answer",
                     {"credentials": {"passcode": password}, "stateHandle": sh, "uid": username})
     if "json" not in r.headers.get("content-type", ""):
-        raise RuntimeError("password POST was intercepted (WAF token invalid/expired)")
+        raise StaleStateError("password POST intercepted (WAF token likely expired)")
     j = r.json()
     sh = j.get("stateHandle")
     msgs = _messages(j)
     if msgs:
-        raise RuntimeError(f"State Farm rejected the credentials: {msgs}")
+        text = " ".join(str(m) for m in msgs).lower()
+        if any(w in text for w in ("expire", "session", "timed out", "timeout")):
+            raise StaleStateError(str(msgs))
+        raise CredentialError(f"State Farm rejected the credentials: {msgs}")
     if not sh:
-        raise RuntimeError("password step returned no stateHandle")
+        raise StaleStateError("password step returned no stateHandle")
     email = _find_email_authenticator(j)
     if not email:
         raise RuntimeError("no email MFA option offered after password")
@@ -190,6 +207,13 @@ async def resume(http, data: dict, username: str, password: str) -> None:
     sh = (await _post(http, "/api/idp/idx/challenge",
                       {"authenticator": auth, "stateHandle": sh})).json()["stateHandle"]
     data["stateHandle"] = sh
+
+
+async def resume(http, data: dict, username: str, password: str) -> None:
+    """identify (if not already prewarmed) → password → request OTP."""
+    if not data.get("identify_done"):
+        await identify_step(http, data, username)
+    await answer_password(http, data, username, password)
 
 
 async def start(http, data: dict, username: str, password: str) -> None:

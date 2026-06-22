@@ -114,10 +114,16 @@ function syncPwField() {
 // Track the warm-up as a promise so login can wait for it — the State Farm mint
 // (the ~2-3s WAF-token browser) runs here, overlapping credential typing, so the
 // Login click only pays for the fast HTTP IDX flow.
+// State Farm also prewarms the username-only login steps (identify) the moment
+// you leave the username field — overlapping password typing — so the Login click
+// pays for just password + OTP. No-op for other carriers.
+const IDENTIFY_PREWARM = ['statefarm'];
 let warming = Promise.resolve();
+let warming2 = Promise.resolve();
 $('carrier').onchange = () => {
   resetUI();
   syncPwField();
+  warming2 = Promise.resolve();
   warming = (async () => {
     if (prewarmSid) { navigator.sendBeacon('/api/session/' + prewarmSid + '/close'); prewarmSid = null; }
     try {
@@ -129,10 +135,24 @@ $('carrier').onchange = () => {
     } catch (_) { prewarmSid = null; }
   })();
 };
+$('username').addEventListener('blur', () => {
+  const u = $('username').value.trim();
+  if (!u || !IDENTIFY_PREWARM.includes($('carrier').value)) return;
+  warming2 = (async () => {
+    await warming;                   // need the carrier-select prewarm (session + mint) first
+    if (!prewarmSid) return;
+    try {
+      await api('/api/prewarm', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ carrier: $('carrier').value, username: u, session_id: prewarmSid }),
+      });
+    } catch (_) {}
+  })();
+});
 
 $('loginBtn').onclick = async () => {
   log('warming up…');
-  await warming;                     // wait for the prewarm mint so login reuses it (no mint at click)
+  await warming; await warming2;     // both prewarm stages (mint + identify) so login reuses them
   log('logging in…');
   lat.login = lat.render = null; $('latency').textContent = '';
   tLogin = performance.now(); tMfa = null;
