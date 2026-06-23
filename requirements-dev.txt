@@ -1,0 +1,4 @@
+# Test-only dependencies — kept out of the runtime image (requirements.txt).
+#   pip install -r requirements-dev.txt && pytest -q
+pytest==9.1.1
+pytest-asyncio==1.4.0
