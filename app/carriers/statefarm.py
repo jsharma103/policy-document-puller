@@ -18,6 +18,7 @@ Playwright page/context).
 """
 import re
 from datetime import datetime
+from weakref import WeakKeyDictionary
 
 from playwright.async_api import BrowserContext, Page
 
@@ -45,9 +46,20 @@ _DC_PROXY = ("https://documentcenterproxyv1-prod-custdocmgmtweb.apps.gdrosa."
              "redk8s.statefarm.com/DocumentCenterProxyV1")
 _DOC_INFO_SVC = ("https://documentinformationservice-prod-custdocmgmtweb.apps."
                  "gdrosa.redk8s.statefarm.com/DocumentInformationService")
-# Bearer token for the doc APIs, keyed by the live session object (Playwright
-# context for the browser path, ApiSession for the API path).
-_ctx_auth: dict[int, str] = {}
+# Bearer token for the doc APIs, keyed by the live session object itself — the
+# ApiSession (API path) or the Playwright BrowserContext (browser path). A
+# WeakKeyDictionary keys by object identity (no id() reuse across sessions) and
+# drops the entry automatically when the session is GC'd — so tokens can't leak
+# or bleed between concurrent users. Access only through _set_auth / _get_auth.
+_session_auth: "WeakKeyDictionary" = WeakKeyDictionary()
+
+
+def _set_auth(sess, value: str) -> None:
+    _session_auth[sess] = value
+
+
+def _get_auth(sess) -> str | None:
+    return _session_auth.get(sess)
 
 USER_SELS = ("#input", "input[autocomplete~='username']",
              "input[autocomplete*='username' i]",
@@ -158,7 +170,7 @@ class StateFarmAdapter:
 
     async def _api_submit_mfa(self, api: ApiSession, code: str) -> None:
         tok = await _sf_idx.finish(api.http, api.data, code)
-        _ctx_auth[id(api)] = f"Bearer {tok}"
+        _set_auth(api, f"Bearer {tok}")
         print("  [sf] API login complete (OAuth token captured)", flush=True)
 
     def _doc_session(self, api: ApiSession):
@@ -177,7 +189,7 @@ class StateFarmAdapter:
         return d
 
     async def _api_list_documents(self, api: ApiSession) -> list[DocMeta]:
-        auth = _ctx_auth.get(id(api))
+        auth = _get_auth(api)
         if not auth:
             raise RuntimeError("no OAuth token for this session")
         http = self._doc_session(api)
@@ -192,7 +204,7 @@ class StateFarmAdapter:
         return docs
 
     async def _api_fetch_pdf(self, api: ApiSession, doc: DocMeta) -> bytes:
-        auth = _ctx_auth.get(id(api))
+        auth = _get_auth(api)
         headers = {"authorization": auth}
         http = self._doc_session(api)
         r = await http.get(
@@ -298,7 +310,7 @@ class StateFarmAdapter:
             data = await (await info.value).json()
             tok = data.get("access_token")
             if tok:
-                _ctx_auth[id(page.context)] = f"Bearer {tok}"
+                _set_auth(page.context, f"Bearer {tok}")
                 return
         except Exception:
             pass
@@ -331,7 +343,7 @@ class StateFarmAdapter:
         return docs
 
     async def _customer_metadata_direct(self, context: BrowserContext):
-        auth = _ctx_auth.get(id(context))
+        auth = _get_auth(context)
         if not auth:
             raise RuntimeError("no OAuth token captured")
         r = await context.request.get(f"{_DC_PROXY}/customerMetadata?year={datetime.now().year}",
@@ -348,7 +360,7 @@ class StateFarmAdapter:
             return await self._fetch_pdf_via_viewer(context, page, doc)
 
     async def _fetch_pdf_direct(self, context: BrowserContext, doc: DocMeta) -> bytes:
-        auth = _ctx_auth.get(id(context))
+        auth = _get_auth(context)
         if not auth:
             raise RuntimeError("no captured Bearer token for this session")
         headers = {"authorization": auth}
@@ -392,13 +404,13 @@ class StateFarmAdapter:
 
     async def _load_doc_center(self, page: Page):
         _pat = re.compile(r"documentinformationservice")
-        cid = id(page.context)
+        ctx = page.context
 
         def _grab_auth(req):
             if "documentcenterproxyv1" in req.url or "documentinformationservice" in req.url:
                 a = (req.headers or {}).get("authorization")
                 if a:
-                    _ctx_auth[cid] = a
+                    _set_auth(ctx, a)
 
         async def _block(route):
             try:
